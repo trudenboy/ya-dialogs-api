@@ -158,6 +158,7 @@ ignore = [
     "D",       # docstrings not required in tests
 ]
 "src/ya_dialogs_api/api_client.py" = ["PLR2004"]  # HTTP status codes
+"src/ya_dialogs_api/errors.py" = ["PLR2004", "PLR0911"]  # HTTP status, multi-format dispatch
 "src/ya_dialogs_api/constants.py" = ["S105"]      # public client IDs, not secrets
 "e2e_all_flows.py" = ["T20", "S101", "S105", "D", "PLR", "ASYNC250"]
 
