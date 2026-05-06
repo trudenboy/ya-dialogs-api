@@ -80,7 +80,7 @@ __all__ = [
     "DialogsSkillNotFoundError",
     "DialogsValidationError",
     "auto_create_skill",
-    "auto_rename_dialog_skill",
+    "auto_update_skill",
     "build_dialog_draft_payload",
     "build_oauth_app_payload",
     "build_smart_home_draft_payload",
@@ -1162,34 +1162,55 @@ async def _step_request_deploy(
     return artifacts
 
 
-async def auto_rename_dialog_skill(
+async def auto_update_skill(
     *,
     authenticator: AuthenticatorCM,
     artifacts: SkillCreationArtifacts,
-    new_name: str,
+    skill_name: str,
     backend_uri: str,
-    description: str,
+    channel: Channel = SMART_HOME_CHANNEL,
+    description: str | None = None,
     structured_examples: list[dict[str, Any]] | None = None,
     activation_phrases: list[str] | None = None,
-    category: str = "music_audio",
-    voice: str = "good_oksana",
+    category: str | None = None,
+    voice: str | None = None,
+    progress_cb: Callable[[SkillCreationArtifacts], Awaitable[None]] | None = None,
     creator_factory: Callable[[aiohttp.ClientSession], DialogsSkillCreator] | None = None,
     developer_name: str = "Skill creator",
 ) -> SkillCreationArtifacts:
-    """Rename a dialog skill and re-deploy it.
+    """Update a skill draft and re-deploy it.
 
-    Patches the draft ``name`` field and calls ``request_deploy``. Does
-    not raise on failure — returns artifacts with ``state=FAILED`` and
-    ``last_error`` so the UI can display the message.
+    Works for both ``channel="smartHome"`` and ``channel="aliceSkill"``.
+    Patches the full draft payload and calls ``request_deploy``. Does not
+    raise on failure — returns artifacts with ``state=FAILED`` and
+    ``last_error`` set so the UI can display the message.
 
-    On success the returned artifacts have ``last_known_name=new_name``
-    and ``state=DONE`` so a UI drift-detector can clear its banner.
+    On success the returned artifacts have ``last_known_name=skill_name``
+    and ``state=DONE``.
+
+    Args:
+        authenticator: No-arg async context-manager factory yielding an
+            authenticated ``aiohttp.ClientSession``.
+        artifacts: Current state machine snapshot (must have ``skill_id`` set).
+        skill_name: New display name for the skill.
+        backend_uri: Webhook backend URL.
+        channel: ``"smartHome"`` or ``"aliceSkill"``. Selects the draft
+            payload builder and the deploy channel query parameter.
+        description: Required for ``channel="aliceSkill"``, ignored for
+            ``channel="smartHome"``.
+        structured_examples: Alice dialog examples (``aliceSkill`` only).
+        activation_phrases: Activation phrases (``aliceSkill`` only).
+        category: Skill category (``aliceSkill`` only).
+        voice: TTS voice (``aliceSkill`` only).
+        progress_cb: Awaitable called after each state transition.
+        creator_factory: Override for the low-level client (used in tests).
+        developer_name: Developer display name embedded in the draft.
     """
     if artifacts.skill_id is None:
-        msg = "skill_id is missing — cannot rename a skill that has not been created"
+        msg = "skill_id is missing — cannot update a skill that has not been created"
         return dataclasses.replace(artifacts, state=SkillCreationState.FAILED, last_error=msg)
-    if not description.strip():
-        msg = "description (non-empty) is required for auto_rename_dialog_skill"
+    if channel == DIALOG_CHANNEL and not (description or "").strip():
+        msg = "description (non-empty) is required for channel='aliceSkill'"
         return dataclasses.replace(artifacts, state=SkillCreationState.FAILED, last_error=msg)
 
     skill_id = artifacts.skill_id
@@ -1199,37 +1220,53 @@ async def auto_rename_dialog_skill(
             creator = (
                 creator_factory(session)
                 if creator_factory is not None
-                else DialogsSkillCreator(session, channel=DIALOG_CHANNEL)
+                else DialogsSkillCreator(session, channel=channel)
             )
             csrf = await creator.fetch_csrf()
 
-            draft = build_dialog_draft_payload(
-                skill_name=new_name,
-                backend_uri=backend_uri,
-                logo_id=artifacts.logo_id,
-                description=description,
-                structured_examples=structured_examples,
-                activation_phrases=activation_phrases,
-                category=category,
-                voice=voice,
-                developer_name=developer_name,
-            )
+            if channel == SMART_HOME_CHANNEL:
+                draft: dict[str, Any] = build_smart_home_draft_payload(
+                    skill_name=skill_name,
+                    backend_uri=backend_uri,
+                    logo_id=artifacts.logo_id,
+                    developer_name=developer_name,
+                )
+            else:
+                draft = build_dialog_draft_payload(
+                    skill_name=skill_name,
+                    backend_uri=backend_uri,
+                    logo_id=artifacts.logo_id,
+                    description=description or "",
+                    structured_examples=structured_examples,
+                    activation_phrases=activation_phrases,
+                    category=category or "music_audio",
+                    voice=voice or "good_oksana",
+                    developer_name=developer_name,
+                )
+
             await creator.update_draft(csrf, skill_id, draft)
             await creator.request_deploy(csrf, skill_id)
-            _LOGGER.info("auto-skill: dialog skill renamed to %r and re-deployed", new_name)
-            return dataclasses.replace(
+            _LOGGER.info(
+                "auto-skill: skill %r updated to name=%r and re-deployed (channel=%s)",
+                skill_id,
+                skill_name,
+                channel,
+            )
+            updated = dataclasses.replace(
                 artifacts,
                 state=SkillCreationState.DONE,
-                last_known_name=new_name,
+                last_known_name=skill_name,
                 last_error=None,
             )
+            await _maybe_save(progress_cb, updated)
+            return updated
     except asyncio.CancelledError:
         raise
     except DialogsApiError as exc:
-        _LOGGER.warning("rename-dialog-skill failed: %s", exc, exc_info=True)
+        _LOGGER.warning("auto-update-skill failed: %s", exc, exc_info=True)
         return dataclasses.replace(artifacts, state=SkillCreationState.FAILED, last_error=str(exc))
     except Exception as exc:
-        _LOGGER.exception("rename-dialog-skill hit unexpected error")
+        _LOGGER.exception("auto-update-skill hit unexpected error")
         return dataclasses.replace(artifacts, state=SkillCreationState.FAILED, last_error=repr(exc))
 
 

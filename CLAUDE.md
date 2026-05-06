@@ -70,7 +70,7 @@ caller (any Python project)
   dataclass; pass it in, get an updated copy back. Persist between calls.
   `progress_cb` fires on every state transition for incremental persistence.
 - **Failures are values, not exceptions.** `auto_create_skill` and
-  `auto_rename_dialog_skill` never raise on Yandex API errors — they return
+  `auto_update_skill` never raise on Yandex API errors — they return
   artifacts with `state=FAILED` and `last_error` set. Truly unexpected
   exceptions still propagate.
 

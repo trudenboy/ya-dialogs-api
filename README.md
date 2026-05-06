@@ -121,7 +121,7 @@ application (account-linking). Partial sets raise `ValueError` synchronously.
 | Symbol | Description |
 |--------|-------------|
 | `auto_create_skill(...)` | Full pipeline orchestrator. Resumable via `SkillCreationArtifacts`. |
-| `auto_rename_dialog_skill(...)` | Patch dialog skill draft name and re-deploy. |
+| `auto_update_skill(...)` | Patch a skill draft and re-deploy. Works for both channels. |
 | `DialogsSkillCreator` | Low-level client (one method per pipeline step, including `delete_skill`). |
 | `Channel` | `Literal["smartHome", "aliceSkill"]` — Yandex wire values. |
 | `SMART_HOME_CHANNEL` / `DIALOG_CHANNEL` | Typed constants for the two channels. |

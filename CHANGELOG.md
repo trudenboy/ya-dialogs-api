@@ -40,6 +40,13 @@ without an attached OAuth application.
   back to `load_default_logo_bytes()`. Previously required.
 - The `auto_create_skill` pipeline raises `ValueError` (synchronously) on
   invalid OAuth-arg combinations rather than returning `state=FAILED`.
+- **`auto_rename_dialog_skill` replaced by `auto_update_skill(channel=...)`.**
+  The old name was misleading — the function patches the full draft, not
+  just the name, and works for both channels. Migration:
+    - `auto_rename_dialog_skill(new_name=..., description=...)` →
+      `auto_update_skill(skill_name=..., channel="aliceSkill", description=...)`
+    - For Smart Home: `auto_update_skill(skill_name=..., channel="smartHome")`
+      (no `description` needed).
 
 ### Added
 
@@ -61,10 +68,15 @@ without an attached OAuth application.
     - `parse_error_body(body, *, http_status, step)` — best-effort parser
       returning the most specific exception type derivable from a 4xx/5xx
       body across the four formats Yandex emits.
+- **`auto_update_skill(channel=...)`** — universal draft-update + re-deploy
+  for both channels. Empirically verified on 2026-05-06 that
+  `PATCH /apps/{id}/draft/update` and
+  `POST /apps/{id}/draft/request-deploy?channel=smartHome` succeed for
+  Smart Home skills (HTTP 200 on both).
 - **`description` validation.** `auto_create_skill(channel="aliceSkill", ...)`
-  and `auto_rename_dialog_skill` reject empty or whitespace-only descriptions
-  (`description.strip() == ""`) before any network call, returning
-  `state=FAILED` with a clear `last_error`.
+  and `auto_update_skill(channel="aliceSkill", ...)` reject empty or
+  whitespace-only descriptions (`description.strip() == ""`) before any
+  network call, returning `state=FAILED` with a clear `last_error`.
 - 28 new tests covering: optional OAuth combinations, `description.strip()`,
   the four error-body shapes, `delete_skill` channel routing, `fetch_csrf`
   redirect handling, typed errors. **75 tests total** (up from 47); coverage
@@ -93,6 +105,7 @@ without an attached OAuth application.
   `auto_create_skill(channel="aliceSkill", ...)`. The OAuth-free pipeline
   is selected automatically when no `oauth_*` params are passed for an
   `aliceSkill` skill.
+- **`auto_rename_dialog_skill`** — superseded by `auto_update_skill`.
 - **`SkillType`** literal alias — use `Channel` instead.
 
 ## [1.0.0] — 2026-05-06

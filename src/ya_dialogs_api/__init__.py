@@ -11,7 +11,8 @@ Public API:
 - :func:`auto_create_skill` — full pipeline; ``channel="smartHome"`` requires
   OAuth (account-linking), ``channel="aliceSkill"`` accepts OAuth-free or
   OAuth-attached. Resumable via :class:`SkillCreationArtifacts`.
-- :func:`auto_rename_dialog_skill` — patch a dialog skill draft and re-deploy.
+- :func:`auto_update_skill` — patch an existing skill draft and re-deploy.
+  Works for both channels.
 - :class:`DialogsSkillCreator` — low-level dev-console client (one method
   per pipeline step). Use this if you need finer control than
   :func:`auto_create_skill` provides — includes ``delete_skill``.
@@ -50,7 +51,7 @@ from .api_client import (
     DialogsSkillNotFoundError,
     DialogsValidationError,
     auto_create_skill,
-    auto_rename_dialog_skill,
+    auto_update_skill,
     build_dialog_draft_payload,
     build_oauth_app_payload,
     build_smart_home_draft_payload,
@@ -84,7 +85,7 @@ __all__ = [
     "SkillCreationArtifacts",
     "SkillCreationState",
     "auto_create_skill",
-    "auto_rename_dialog_skill",
+    "auto_update_skill",
     "build_dialog_draft_payload",
     "build_oauth_app_payload",
     "build_smart_home_draft_payload",

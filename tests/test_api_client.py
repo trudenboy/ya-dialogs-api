@@ -28,7 +28,7 @@ from ya_dialogs_api import (
     SkillCreationArtifacts,
     SkillCreationState,
     auto_create_skill,
-    auto_rename_dialog_skill,
+    auto_update_skill,
     build_dialog_draft_payload,
     build_oauth_app_payload,
     build_smart_home_draft_payload,
@@ -1018,12 +1018,12 @@ class TestAutoCreateDialogSkillDefaults:
         assert png_arg[:8] == bytes.fromhex("89504e470d0a1a0a")
 
 
-class TestAutoRenameDialogSkill:
-    """auto_rename_dialog_skill patches the draft and re-deploys."""
+class TestAutoUpdateSkill:
+    """auto_update_skill patches the draft and re-deploys for both channels."""
 
     @pytest.mark.asyncio
-    async def test_happy_path(self) -> None:
-        """Rename produces DONE state with the new last_known_name."""
+    async def test_smart_home_happy_path(self) -> None:
+        """smartHome update produces DONE with new name and a smartHome-shaped payload."""
         creator = _make_creator_mock()
         artifacts = SkillCreationArtifacts(
             state=SkillCreationState.DONE,
@@ -1031,37 +1031,80 @@ class TestAutoRenameDialogSkill:
             logo_id="lg-1",
             last_known_name="Old Name",
         )
-        result = await auto_rename_dialog_skill(
+        result = await auto_update_skill(
             authenticator=_fake_authenticator(),
             artifacts=artifacts,
-            new_name="New Name",
-            backend_uri=_TEST_DIALOG_BACKEND_URI,
-            description="A skill with a new name.",
+            skill_name="New Smart Home Name",
+            backend_uri=_TEST_BACKEND_URI,
+            channel=SMART_HOME_CHANNEL,
             creator_factory=lambda _s: creator,
         )
         assert result.state == SkillCreationState.DONE
-        assert result.last_known_name == "New Name"
+        assert result.last_known_name == "New Smart Home Name"
         assert result.last_error is None
         creator.update_draft.assert_awaited_once()
         creator.request_deploy.assert_awaited_once()
+        # smartHome payload shape: has publishingSettings.category="smart_home"
+        sent_payload = creator.update_draft.await_args.args[2]
+        assert sent_payload["channel"] == SMART_HOME_CHANNEL
+        assert sent_payload["name"] == "New Smart Home Name"
+        assert "structuredExamples" not in sent_payload.get("publishingSettings", {})
+
+    @pytest.mark.asyncio
+    async def test_dialog_happy_path(self) -> None:
+        """aliceSkill update produces DONE; payload carries description."""
+        creator = _make_creator_mock()
+        artifacts = SkillCreationArtifacts(
+            state=SkillCreationState.DONE,
+            skill_id="sk-1",
+            logo_id="lg-1",
+        )
+        result = await auto_update_skill(
+            authenticator=_fake_authenticator(),
+            artifacts=artifacts,
+            skill_name="New Dialog Name",
+            backend_uri=_TEST_DIALOG_BACKEND_URI,
+            channel=DIALOG_CHANNEL,
+            description="A dialog skill description.",
+            creator_factory=lambda _s: creator,
+        )
+        assert result.state == SkillCreationState.DONE
+        assert result.last_known_name == "New Dialog Name"
+        sent_payload = creator.update_draft.await_args.args[2]
+        assert sent_payload["channel"] == DIALOG_CHANNEL
+        assert sent_payload["publishingSettings"]["description"] == "A dialog skill description."
 
     @pytest.mark.asyncio
     async def test_missing_skill_id_returns_failed_immediately(self) -> None:
-        """Renaming an uncreated skill is a no-op error, not a crash."""
-        result = await auto_rename_dialog_skill(
+        """Updating an uncreated skill is a no-op error, not a crash."""
+        result = await auto_update_skill(
             authenticator=_fake_authenticator(),
             artifacts=SkillCreationArtifacts(),  # no skill_id
-            new_name="Whatever",
-            backend_uri=_TEST_DIALOG_BACKEND_URI,
-            description="d",
+            skill_name="Whatever",
+            backend_uri=_TEST_BACKEND_URI,
         )
         assert result.state == SkillCreationState.FAILED
         assert result.last_error is not None
         assert "skill_id" in result.last_error
 
     @pytest.mark.asyncio
+    async def test_dialog_empty_description_returns_failed(self) -> None:
+        """aliceSkill requires non-empty description; whitespace alone is rejected."""
+        result = await auto_update_skill(
+            authenticator=_fake_authenticator(),
+            artifacts=SkillCreationArtifacts(skill_id="sk-1", logo_id="lg-1"),
+            skill_name="N",
+            backend_uri=_TEST_DIALOG_BACKEND_URI,
+            channel=DIALOG_CHANNEL,
+            description="   ",
+        )
+        assert result.state == SkillCreationState.FAILED
+        assert result.last_error is not None
+        assert "description" in result.last_error
+
+    @pytest.mark.asyncio
     async def test_dialogs_api_error_returns_failed(self) -> None:
-        """A DialogsApiError during rename produces FAILED, not a raise."""
+        """A DialogsApiError during update produces FAILED, not a raise."""
         creator = _make_creator_mock()
         creator.update_draft.side_effect = DialogsApiError(
             "moderation rejected", step="update_draft", http_status=400
@@ -1071,17 +1114,44 @@ class TestAutoRenameDialogSkill:
             skill_id="sk-1",
             logo_id="lg-1",
         )
-        result = await auto_rename_dialog_skill(
+        result = await auto_update_skill(
             authenticator=_fake_authenticator(),
             artifacts=artifacts,
-            new_name="N",
-            backend_uri=_TEST_DIALOG_BACKEND_URI,
-            description="d",
+            skill_name="N",
+            backend_uri=_TEST_BACKEND_URI,
+            channel=SMART_HOME_CHANNEL,
             creator_factory=lambda _s: creator,
         )
         assert result.state == SkillCreationState.FAILED
         assert result.last_error is not None
         assert "moderation" in result.last_error
+
+    @pytest.mark.asyncio
+    async def test_progress_cb_invoked_on_success(self) -> None:
+        """progress_cb fires once with the final DONE artifacts on success."""
+        creator = _make_creator_mock()
+        artifacts = SkillCreationArtifacts(
+            state=SkillCreationState.DONE,
+            skill_id="sk-1",
+            logo_id="lg-1",
+        )
+        snapshots: list[SkillCreationArtifacts] = []
+
+        async def cb(a: SkillCreationArtifacts) -> None:
+            snapshots.append(a)
+
+        result = await auto_update_skill(
+            authenticator=_fake_authenticator(),
+            artifacts=artifacts,
+            skill_name="Updated",
+            backend_uri=_TEST_BACKEND_URI,
+            channel=SMART_HOME_CHANNEL,
+            progress_cb=cb,
+            creator_factory=lambda _s: creator,
+        )
+        assert result.state == SkillCreationState.DONE
+        assert len(snapshots) == 1
+        assert snapshots[0].last_known_name == "Updated"
 
 
 class TestLoadDefaultLogoBytes:
