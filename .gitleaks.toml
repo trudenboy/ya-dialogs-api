@@ -1,0 +1,22 @@
+# Gitleaks configuration for ya-dialogs-api.
+#
+# Inherits the default ruleset and adds allowlist entries for known false
+# positives — synthetic UUIDs in test fixtures and a public CSRF-token shape
+# documented in a regex comment.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Synthetic test fixtures + documentation comments — not real secrets"
+paths = [
+    # Test fixtures use synthetic UUIDs to round-trip the state machine; they
+    # are not credentials, just identifiers.
+    '''tests/test_state\.py''',
+]
+regexes = [
+    # CSRF token shape captured from a HAR file, kept in a comment to document
+    # the regex pattern. The truncated value (no closing quote) is documentation,
+    # not a credential.
+    '''"secretkey":"u9c94f1aca53bf156be4''',
+]
