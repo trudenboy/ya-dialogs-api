@@ -11,6 +11,8 @@ Public API:
 - :func:`auto_create_skill` — full pipeline: create app → upload logo →
   patch draft → create OAuth app → attach → publish. Resumable via
   ``SkillCreationArtifacts``.
+- :func:`auto_create_dialog_skill` — OAuth-free dialog (``aliceSkill``)
+  pipeline. Use this for custom Alice skills that don't need account-linking.
 - :func:`auto_rename_dialog_skill` — patch a dialog skill draft and re-deploy.
 - :class:`DialogsSkillCreator` — low-level dev-console client (one method
   per pipeline step). Use this if you need finer control than
@@ -43,6 +45,7 @@ from .api_client import (
     DialogsDuplicateSkillError,
     DialogsSkillCreator,
     SkillType,
+    auto_create_dialog_skill,
     auto_create_skill,
     auto_rename_dialog_skill,
     build_dialog_draft_payload,
@@ -74,6 +77,7 @@ __all__ = [
     "SkillCreationArtifacts",
     "SkillCreationState",
     "SkillType",
+    "auto_create_dialog_skill",
     "auto_create_skill",
     "auto_rename_dialog_skill",
     "build_dialog_draft_payload",

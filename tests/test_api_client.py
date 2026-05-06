@@ -22,6 +22,7 @@ from ya_dialogs_api import (
     DialogsSkillCreator,
     SkillCreationArtifacts,
     SkillCreationState,
+    auto_create_dialog_skill,
     auto_create_skill,
     auto_rename_dialog_skill,
     build_dialog_draft_payload,
@@ -794,6 +795,211 @@ class TestAuthenticatorRequired:
             creator_factory=_factory,
         )
         assert captured == [session]
+
+
+async def _run_dialog_orch(
+    *,
+    creator: AsyncMock,
+    artifacts: SkillCreationArtifacts | None = None,
+    progress_cb: Any = None,
+    description: str = _TEST_DIALOG_DESCRIPTION,
+    logo_bytes: bytes | None = b"\x89PNG fake",
+) -> SkillCreationArtifacts:
+    """Run auto_create_dialog_skill with fake authenticator + injected creator."""
+    return await auto_create_dialog_skill(
+        authenticator=_fake_authenticator(),
+        skill_name="Test Dialog Skill",
+        artifacts=artifacts if artifacts is not None else SkillCreationArtifacts(),
+        backend_uri=_TEST_DIALOG_BACKEND_URI,
+        description=description,
+        logo_bytes=logo_bytes,
+        creator_factory=lambda _session: creator,
+        progress_cb=progress_cb,
+    )
+
+
+class TestAutoCreateDialogSkillHappyPath:
+    """auto_create_dialog_skill end-to-end: OAuth-free pipeline runs in order."""
+
+    @pytest.mark.asyncio
+    async def test_runs_create_logo_draft_deploy_no_oauth(self) -> None:
+        """All 4 OAuth-free steps run; OAuth methods never called; final state DONE."""
+        creator = _make_creator_mock()
+        result = await _run_dialog_orch(creator=creator)
+        assert result.state == SkillCreationState.DONE
+        assert result.skill_id == "skill-id-123"
+        assert result.logo_id == "logo-id-456"
+        assert result.last_known_name == "Test Dialog Skill"
+        assert result.last_error is None
+        # OAuth-free: oauth_app_id never populated
+        assert result.oauth_app_id is None
+        creator.fetch_csrf.assert_awaited_once()
+        creator.create_app.assert_awaited_once_with("csrf-token", "Test Dialog Skill")
+        creator.upload_logo.assert_awaited_once()
+        creator.update_draft.assert_awaited_once()
+        creator.request_deploy.assert_awaited_once()
+        # Critical: OAuth methods MUST NOT be called for dialog skills.
+        creator.create_oauth_app.assert_not_awaited()
+        creator.attach_oauth.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_progress_cb_called_per_state_transition(self) -> None:
+        """progress_cb fires at every state checkpoint; no OAuth states emitted."""
+        states_seen: list[SkillCreationState] = []
+
+        async def _cb(art: SkillCreationArtifacts) -> None:
+            states_seen.append(art.state)
+
+        result = await _run_dialog_orch(creator=_make_creator_mock(), progress_cb=_cb)
+        assert result.state == SkillCreationState.DONE
+        assert SkillCreationState.APP_CREATED in states_seen
+        assert SkillCreationState.DRAFT_UPDATED in states_seen
+        assert SkillCreationState.DEPLOY_REQUESTED in states_seen
+        assert states_seen[-1] == SkillCreationState.DONE
+        # OAuth-free flow never touches OAuth_* states.
+        assert SkillCreationState.OAUTH_CREATED not in states_seen
+        assert SkillCreationState.OAUTH_ATTACHED not in states_seen
+
+    @pytest.mark.asyncio
+    async def test_update_draft_uses_alice_skill_channel_payload(self) -> None:
+        """update_draft is invoked with the aliceSkill channel payload."""
+        creator = _make_creator_mock()
+        await _run_dialog_orch(creator=creator)
+        update_call = creator.update_draft.await_args
+        assert update_call is not None
+        payload = (
+            update_call.args[2] if len(update_call.args) >= 3 else update_call.kwargs.get("payload")
+        )
+        assert payload["channel"] == "aliceSkill"
+        assert payload["publishingSettings"]["description"] == _TEST_DIALOG_DESCRIPTION
+
+
+class TestAutoCreateDialogSkillResume:
+    """Pipeline skips already-completed steps when given partial artifacts."""
+
+    @pytest.mark.asyncio
+    async def test_resume_from_app_created_skips_create(self) -> None:
+        """Resuming from APP_CREATED skips create_app; runs logo+draft+deploy."""
+        creator = _make_creator_mock()
+        artifacts = SkillCreationArtifacts(
+            state=SkillCreationState.APP_CREATED,
+            skill_id="existing-skill",
+        )
+        result = await _run_dialog_orch(creator=creator, artifacts=artifacts)
+        assert result.state == SkillCreationState.DONE
+        assert result.skill_id == "existing-skill"  # not overwritten
+        creator.create_app.assert_not_awaited()
+        creator.upload_logo.assert_awaited_once()
+        creator.update_draft.assert_awaited_once()
+        creator.request_deploy.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_resume_from_draft_updated_only_publishes(self) -> None:
+        """Resuming from DRAFT_UPDATED checkpoints DEPLOY_REQUESTED + publishes only."""
+        creator = _make_creator_mock()
+        artifacts = SkillCreationArtifacts(
+            state=SkillCreationState.DRAFT_UPDATED,
+            skill_id="existing-skill",
+            logo_id="existing-logo",
+        )
+        result = await _run_dialog_orch(creator=creator, artifacts=artifacts)
+        assert result.state == SkillCreationState.DONE
+        creator.create_app.assert_not_awaited()
+        creator.upload_logo.assert_not_awaited()
+        creator.update_draft.assert_not_awaited()
+        creator.request_deploy.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_resume_from_deploy_requested_only_publishes(self) -> None:
+        """Resuming from DEPLOY_REQUESTED only runs request_deploy."""
+        creator = _make_creator_mock()
+        artifacts = SkillCreationArtifacts(
+            state=SkillCreationState.DEPLOY_REQUESTED,
+            skill_id="existing-skill",
+            logo_id="existing-logo",
+        )
+        result = await _run_dialog_orch(creator=creator, artifacts=artifacts)
+        assert result.state == SkillCreationState.DONE
+        creator.create_app.assert_not_awaited()
+        creator.upload_logo.assert_not_awaited()
+        creator.update_draft.assert_not_awaited()
+        creator.request_deploy.assert_awaited_once()
+
+
+class TestAutoCreateDialogSkillFailure:
+    """Failures surface as FAILED artifacts with last_error."""
+
+    @pytest.mark.asyncio
+    async def test_empty_description_returns_failed_no_network(self) -> None:
+        """Empty description short-circuits to FAILED before any API call."""
+        creator = _make_creator_mock()
+        result = await _run_dialog_orch(creator=creator, description="")
+        assert result.state == SkillCreationState.FAILED
+        assert result.last_error is not None
+        assert "description" in result.last_error
+        creator.fetch_csrf.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_create_app_failure_returns_failed(self) -> None:
+        """A DialogsApiError mid-pipeline returns FAILED, not a raise."""
+        creator = _make_creator_mock()
+        creator.create_app.side_effect = DialogsApiError(
+            "boom",
+            step="create_app",
+            http_status=500,
+        )
+        result = await _run_dialog_orch(creator=creator)
+        assert result.state == SkillCreationState.FAILED
+        assert result.last_error is not None
+        assert "boom" in result.last_error
+        creator.upload_logo.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_duplicate_skill_returns_failed(self) -> None:
+        """DialogsDuplicateSkillError surfaces as FAILED with last_error preserved."""
+        creator = _make_creator_mock()
+        creator.create_app.side_effect = DialogsDuplicateSkillError(
+            "Skill name is already taken",
+            step="create_app",
+            http_status=409,
+        )
+        result = await _run_dialog_orch(creator=creator)
+        assert result.state == SkillCreationState.FAILED
+        assert result.last_error is not None
+        assert "already taken" in result.last_error
+
+    @pytest.mark.asyncio
+    async def test_partial_progress_preserved_on_deploy_failure(self) -> None:
+        """If request_deploy fails, FAILED artifacts retain skill_id + logo_id."""
+        creator = _make_creator_mock()
+        creator.request_deploy.side_effect = DialogsApiError(
+            "deploy failed",
+            step="request_deploy",
+            http_status=500,
+        )
+        result = await _run_dialog_orch(creator=creator)
+        assert result.state == SkillCreationState.FAILED
+        assert result.skill_id == "skill-id-123"
+        assert result.logo_id == "logo-id-456"
+
+
+class TestAutoCreateDialogSkillDefaults:
+    """Default parameter behaviour."""
+
+    @pytest.mark.asyncio
+    async def test_default_logo_bytes_loaded_when_none(self) -> None:
+        """logo_bytes=None triggers load_default_logo_bytes."""
+        creator = _make_creator_mock()
+        result = await _run_dialog_orch(creator=creator, logo_bytes=None)
+        assert result.state == SkillCreationState.DONE
+        upload_call = creator.upload_logo.await_args
+        assert upload_call is not None
+        png_arg = (
+            upload_call.args[2] if len(upload_call.args) >= 3 else upload_call.kwargs.get("png")
+        )
+        assert isinstance(png_arg, bytes)
+        # PNG magic header (real bundled asset or 1x1 fallback both start with this)
+        assert png_arg[:8] == bytes.fromhex("89504e470d0a1a0a")
 
 
 class TestAutoRenameDialogSkill:

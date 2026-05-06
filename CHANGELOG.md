@@ -6,6 +6,35 @@ All notable changes to this project will be documented in this file. The format 
 
 ## [Unreleased]
 
+## [1.1.0] — 2026-05-06
+
+### Added
+
+- `auto_create_dialog_skill(...)` — OAuth-free pipeline for custom Alice
+  (``aliceSkill``) skills. Symmetric to `auto_rename_dialog_skill`. Runs only
+  the four steps Yandex requires for dialog skills: ``create_app → upload_logo
+  → update_draft → request_deploy``. Custom Alice skills don't need an
+  attached OAuth application, so callers without an OAuth provider on their
+  backend (typical for voice-skill use cases — e.g.
+  `ma-provider-yandex-alice`) can use this entry point directly. Like
+  `auto_create_skill`, it is resumable via `SkillCreationArtifacts` and
+  surfaces all failures as `state=FAILED` with `last_error`.
+
+  Default `logo_bytes=None` resolves to `load_default_logo_bytes()`.
+
+### Changed
+
+- Pipeline step helpers extracted (`_step_create_app`,
+  `_step_upload_logo_and_update_draft`, `_step_create_oauth_app`,
+  `_step_attach_oauth`, `_step_checkpoint_deploy_requested`,
+  `_step_request_deploy`). `auto_create_skill` and `auto_create_dialog_skill`
+  are now thin orchestrators that compose these helpers — no behaviour
+  change for `auto_create_skill`. The CSRF-fetch + recovery harness
+  (`_run_with_recovery`, formerly `_run_pipeline_with_recovery`) was
+  generalised to take any pipeline executor.
+
+  No breaking changes to the public API.
+
 ## [1.0.0] — 2026-05-06
 
 ### Added
