@@ -6,7 +6,7 @@ All notable changes to this project will be documented in this file. The format 
 
 ## [Unreleased]
 
-## [1.1.0] — 2026-05-06
+## [2.0.0] — 2026-05-06
 
 This release combines an `aliceSkill` OAuth-free pipeline (originally drafted
 as a separate `auto_create_dialog_skill` function), a public-API rename to
