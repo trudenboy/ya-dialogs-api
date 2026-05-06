@@ -449,14 +449,17 @@ class DialogsSkillCreator:
                         )
                         if resp.headers.get(k) is not None
                     }
+                    # NOTE: do NOT log fields from `payload` directly — it can
+                    # contain OAuth client_secret. Channel is duplicated on the
+                    # client object, log it from there instead.
                     _LOGGER.warning(
                         "Yandex %s %s returned %s with empty body; response "
-                        "headers=%s, request payload channel=%r",
+                        "headers=%s, client channel=%r",
                         method,
                         url,
                         resp.status,
                         safe_headers,
-                        payload.get("channel"),
+                        self._channel,
                     )
                 raise parse_error_body(body, http_status=resp.status, step=step)
             data = _try_json_or_raise(body, step=step, method=method, url=url)
