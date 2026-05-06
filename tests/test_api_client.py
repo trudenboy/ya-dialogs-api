@@ -1,0 +1,874 @@
+"""Tests for ya_dialogs_api.api_client — DialogsSkillCreator + orchestrator."""
+
+from __future__ import annotations
+
+import json
+from contextlib import asynccontextmanager
+from typing import TYPE_CHECKING, Any
+from unittest.mock import AsyncMock, MagicMock
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
+import aiohttp
+import pytest
+
+from ya_dialogs_api import (
+    DIALOGS_API_BASE,
+    DIALOGS_DEV_HTML_URL,
+    DialogsApiError,
+    DialogsCsrfError,
+    DialogsDuplicateSkillError,
+    DialogsSkillCreator,
+    SkillCreationArtifacts,
+    SkillCreationState,
+    auto_create_skill,
+    auto_rename_dialog_skill,
+    build_dialog_draft_payload,
+    build_oauth_app_payload,
+    build_smart_home_draft_payload,
+    load_default_logo_bytes,
+)
+
+# Pre-computed URLs / OAuth params used by orchestrator tests.
+# (Replaces the smarthome connection-type derivation that lived inside the lib.)
+_TEST_BACKEND_URI = "https://example.test/api/yandex_smarthome"
+_TEST_AUTH_AUTHORIZE_URL = "https://example.test/api/yandex_smarthome/auth/authorize"
+_TEST_AUTH_TOKEN_URL = "https://example.test/api/yandex_smarthome/auth/token"
+_TEST_OAUTH_CLIENT_ID = "https://social.yandex.net/"
+_TEST_OAUTH_CLIENT_SECRET = "test-secret"
+_TEST_DIALOG_BACKEND_URI = "https://example.test/api/yandex_dialogs/webhook/secret"
+_TEST_DIALOG_DESCRIPTION = "Test skill description for Yandex moderation."
+
+# ---------------------------------------------------------------------------
+# Test helpers: mock aiohttp session matching existing test_cloud.py pattern
+# ---------------------------------------------------------------------------
+
+
+def _mock_response(*, status: int = 200, body_text: str = "", body_json: Any = None) -> AsyncMock:
+    """Build a mock aiohttp.ClientResponse.
+
+    If *body_json* is given, ``text()`` returns its JSON-encoded form;
+    otherwise ``body_text`` is used verbatim. Also wires up
+    ``content.iter_chunked(size)`` as a single-chunk async iterator over
+    ``body_text.encode()`` so ``fetch_csrf``'s streaming reader works.
+    """
+    resp = AsyncMock()
+    resp.status = status
+    if body_json is not None:
+        body_text = json.dumps(body_json, ensure_ascii=False)
+    resp.text = AsyncMock(return_value=body_text)
+    resp.get_encoding = MagicMock(return_value="utf-8")
+
+    body_bytes = body_text.encode("utf-8")
+
+    async def _aiter(_size: int) -> Any:  # pragma: no cover — trivial
+        if body_bytes:
+            yield body_bytes
+
+    resp.content = MagicMock()
+    resp.content.iter_chunked = _aiter
+    return resp
+
+
+def _install_ctx(session_method: MagicMock, mock_resp: AsyncMock) -> MagicMock:
+    """Attach an async context manager returning *mock_resp* to a session method."""
+    ctx = MagicMock()
+    ctx.__aenter__ = AsyncMock(return_value=mock_resp)
+    ctx.__aexit__ = AsyncMock(return_value=False)
+    session_method.return_value = ctx
+    return ctx
+
+
+def _make_session() -> MagicMock:
+    session = MagicMock(spec=aiohttp.ClientSession)
+    session.get = MagicMock()
+    session.post = MagicMock()
+    session.request = MagicMock()
+    return session
+
+
+# ---------------------------------------------------------------------------
+# fetch_csrf
+# ---------------------------------------------------------------------------
+
+
+class TestFetchCsrf:
+    """CSRF token extraction from developer console HTML."""
+
+    @pytest.mark.asyncio
+    async def test_happy_path_returns_token(self) -> None:
+        """CSRF is extracted from the secretkey field in the developer HTML."""
+        html = (
+            "<html><head><script>"
+            'window.state = {"user":{"id":1},"secretkey":"u9c94f1aca53bf156be4abc","foo":"bar"}'
+            "</script></head></html>"
+        )
+        session = _make_session()
+        _install_ctx(session.get, _mock_response(status=200, body_text=html))
+        creator = DialogsSkillCreator(session)
+
+        token = await creator.fetch_csrf()
+        assert token == "u9c94f1aca53bf156be4abc"
+        # Verify we hit the expected URL
+        session.get.assert_called_once_with(DIALOGS_DEV_HTML_URL)
+
+    @pytest.mark.asyncio
+    async def test_regex_miss_raises_csrf_error(self) -> None:
+        """Yandex changed the HTML format → clean typed error for fallback."""
+        html = "<html>no secretkey here</html>"
+        session = _make_session()
+        _install_ctx(session.get, _mock_response(status=200, body_text=html))
+        creator = DialogsSkillCreator(session)
+
+        with pytest.raises(DialogsCsrfError) as exc_info:
+            await creator.fetch_csrf()
+        assert exc_info.value.step == "fetch_csrf"
+
+    @pytest.mark.asyncio
+    async def test_401_maps_to_auth_error(self) -> None:
+        """401 means passport cookies missing/expired — retryable via relogin."""
+        session = _make_session()
+        _install_ctx(session.get, _mock_response(status=401, body_text="nope"))
+        creator = DialogsSkillCreator(session)
+
+        with pytest.raises(DialogsApiError) as exc_info:
+            await creator.fetch_csrf()
+        assert exc_info.value.http_status == 401
+        assert exc_info.value.step == "fetch_csrf"
+
+    @pytest.mark.asyncio
+    async def test_empty_token_raises(self) -> None:
+        """Regex matched but captured empty string — treat as miss."""
+        html = '{"secretkey":""}'
+        session = _make_session()
+        _install_ctx(session.get, _mock_response(status=200, body_text=html))
+        creator = DialogsSkillCreator(session)
+
+        with pytest.raises(DialogsCsrfError):
+            await creator.fetch_csrf()
+
+
+# ---------------------------------------------------------------------------
+# create_app
+# ---------------------------------------------------------------------------
+
+
+class TestCreateApp:
+    """POST /apps — returns skill_id on success."""
+
+    @pytest.mark.asyncio
+    async def test_happy_path_returns_skill_id(self) -> None:
+        """POST /apps returns a skill UUID and sends the expected payload."""
+        session = _make_session()
+        _install_ctx(
+            session.request,
+            _mock_response(
+                status=200,
+                body_json={"result": {"id": "7584419b-6815-4a68-8e32-b9fb111b596d"}},
+            ),
+        )
+        creator = DialogsSkillCreator(session)
+
+        skill_id = await creator.create_app("csrf-token", "My Skill")
+        assert skill_id == "7584419b-6815-4a68-8e32-b9fb111b596d"
+
+        # Verify request shape
+        method, url = session.request.call_args.args[:2]
+        assert method == "POST"
+        assert url == f"{DIALOGS_API_BASE}/apps"
+        payload = session.request.call_args.kwargs["json"]
+        assert payload["channel"] == "smartHome"
+        assert payload["language"] == "ru"
+        assert payload["isYangoConsole"] is False
+        assert payload["appName"] == "My Skill"
+        headers = session.request.call_args.kwargs["headers"]
+        assert headers["x-csrf-token"] == "csrf-token"
+
+    @pytest.mark.asyncio
+    async def test_duplicate_name_raises_typed_error(self) -> None:
+        """HTTP 409 with a duplicate-indicator body maps to DialogsDuplicateSkillError."""
+        session = _make_session()
+        _install_ctx(
+            session.request,
+            _mock_response(
+                status=409,
+                body_json={"error": "not_unique", "message": "skill already exists"},
+            ),
+        )
+        creator = DialogsSkillCreator(session)
+
+        with pytest.raises(DialogsDuplicateSkillError) as exc_info:
+            await creator.create_app("csrf", "duplicate name")
+        assert exc_info.value.http_status == 409
+
+    @pytest.mark.asyncio
+    async def test_generic_4xx_raises_api_error(self) -> None:
+        """Non-duplicate 4xx surfaces as plain DialogsApiError, not the subclass."""
+        session = _make_session()
+        _install_ctx(
+            session.request,
+            _mock_response(status=400, body_text="bad request"),
+        )
+        creator = DialogsSkillCreator(session)
+
+        with pytest.raises(DialogsApiError) as exc_info:
+            await creator.create_app("csrf", "X")
+        # Not a duplicate — should be plain DialogsApiError, not subclass
+        assert not isinstance(exc_info.value, DialogsDuplicateSkillError)
+        assert exc_info.value.http_status == 400
+
+    @pytest.mark.asyncio
+    async def test_missing_skill_id_raises(self) -> None:
+        """A 200 response without an id field is treated as a protocol break."""
+        session = _make_session()
+        _install_ctx(
+            session.request,
+            _mock_response(status=200, body_json={"result": {}}),
+        )
+        creator = DialogsSkillCreator(session)
+
+        with pytest.raises(DialogsApiError):
+            await creator.create_app("csrf", "X")
+
+
+# ---------------------------------------------------------------------------
+# upload_logo
+# ---------------------------------------------------------------------------
+
+
+class TestUploadLogo:
+    """POST /apps/{id}/draft/upload-logo — multipart file upload."""
+
+    @pytest.mark.asyncio
+    async def test_happy_path_returns_logo_id(self) -> None:
+        """upload_logo posts multipart PNG and returns the avatar id."""
+        session = _make_session()
+        _install_ctx(
+            session.post,
+            _mock_response(
+                status=200,
+                body_json={
+                    "result": {
+                        "id": "be043706-a868-4999-83c8-f17bbd60745d",
+                        "url": "https://avatars.mds.yandex.net/...",
+                    }
+                },
+            ),
+        )
+        creator = DialogsSkillCreator(session)
+
+        logo_id = await creator.upload_logo("csrf", "skill-1", b"\x89PNG\r\n\x1a\n...")
+        assert logo_id == "be043706-a868-4999-83c8-f17bbd60745d"
+
+        call = session.post.call_args
+        url = call.args[0]
+        assert "/draft/upload-logo" in url
+        assert "channel=smartHome" in url
+        # FormData used for multipart
+        assert isinstance(call.kwargs["data"], aiohttp.FormData)
+        assert call.kwargs["headers"]["x-csrf-token"] == "csrf"
+
+    @pytest.mark.asyncio
+    async def test_upload_500_raises(self) -> None:
+        """Server-side 500 surfaces as DialogsApiError carrying the step name."""
+        session = _make_session()
+        _install_ctx(session.post, _mock_response(status=500, body_text="oops"))
+        creator = DialogsSkillCreator(session)
+
+        with pytest.raises(DialogsApiError) as exc_info:
+            await creator.upload_logo("csrf", "sk", b"data")
+        assert exc_info.value.step == "upload_logo"
+        assert exc_info.value.http_status == 500
+
+
+# ---------------------------------------------------------------------------
+# update_draft
+# ---------------------------------------------------------------------------
+
+
+class TestUpdateDraft:
+    """PATCH /apps/{id}/draft/update — accepts arbitrary payload dict."""
+
+    @pytest.mark.asyncio
+    async def test_happy_path(self) -> None:
+        """PATCH goes to the right URL with the forwarded payload and CSRF header."""
+        session = _make_session()
+        _install_ctx(
+            session.request,
+            _mock_response(status=200, body_json={"result": {"ok": True}}),
+        )
+        creator = DialogsSkillCreator(session)
+
+        payload = {"name": "Music Assistant", "channel": "smartHome"}
+        await creator.update_draft("csrf", "skill-1", payload)
+
+        method, url = session.request.call_args.args[:2]
+        assert method == "PATCH"
+        assert url == f"{DIALOGS_API_BASE}/apps/skill-1/draft/update"
+        assert session.request.call_args.kwargs["json"] == payload
+
+
+# ---------------------------------------------------------------------------
+# create_oauth_app
+# ---------------------------------------------------------------------------
+
+
+class TestCreateOAuthApp:
+    """POST /oauth/apps — returns oauth_app_id."""
+
+    @pytest.mark.asyncio
+    async def test_happy_path(self) -> None:
+        """create_oauth_app builds the correct payload and returns the new id."""
+        session = _make_session()
+        _install_ctx(
+            session.request,
+            _mock_response(
+                status=200,
+                body_json={"result": {"id": "oauth-uuid-123"}},
+            ),
+        )
+        creator = DialogsSkillCreator(session)
+
+        oauth_id = await creator.create_oauth_app(
+            "csrf",
+            name="My Skill",
+            client_id="yandex_smart_home:inst1",
+            client_secret="secret",
+            authorize_url="https://yaha-cloud.ru/oauth/authorize",
+            token_url="https://yaha-cloud.ru/oauth/token",
+            refresh_url="https://yaha-cloud.ru/oauth/token",
+        )
+        assert oauth_id == "oauth-uuid-123"
+
+        payload = session.request.call_args.kwargs["json"]
+        assert payload["clientId"] == "yandex_smart_home:inst1"
+        assert payload["clientSecret"] == "secret"
+        assert payload["authorizationUrl"] == "https://yaha-cloud.ru/oauth/authorize"
+        assert payload["scope"] == ""
+
+
+# ---------------------------------------------------------------------------
+# attach_oauth
+# ---------------------------------------------------------------------------
+
+
+class TestAttachOAuth:
+    """POST /apps/{id}/oauthApp — links oauth_app to skill."""
+
+    @pytest.mark.asyncio
+    async def test_happy_path(self) -> None:
+        """attach_oauth sends POST with channel query + oauthAppId body."""
+        session = _make_session()
+        _install_ctx(
+            session.request,
+            _mock_response(status=200, body_json={"result": "oauth-id"}),
+        )
+        creator = DialogsSkillCreator(session)
+
+        await creator.attach_oauth("csrf", "skill-1", "oauth-1")
+
+        method, url = session.request.call_args.args[:2]
+        assert method == "POST"
+        assert "channel=smartHome" in url
+        assert session.request.call_args.kwargs["json"] == {"oauthAppId": "oauth-1"}
+
+
+# ---------------------------------------------------------------------------
+# request_deploy
+# ---------------------------------------------------------------------------
+
+
+class TestRequestDeploy:
+    """POST /apps/{id}/draft/request-deploy — publishes draft."""
+
+    @pytest.mark.asyncio
+    async def test_happy_path_empty_body(self) -> None:
+        """Request-deploy uses an empty body and relies on the URL query only."""
+        session = _make_session()
+        _install_ctx(session.post, _mock_response(status=200, body_json={"result": {}}))
+        creator = DialogsSkillCreator(session)
+
+        await creator.request_deploy("csrf", "skill-1")
+
+        call = session.post.call_args
+        url = call.args[0]
+        assert "request-deploy" in url
+        assert "channel=smartHome" in url
+        # No body (only headers)
+        assert "data" not in call.kwargs
+        assert "json" not in call.kwargs
+        assert call.kwargs["headers"]["x-csrf-token"] == "csrf"
+
+    @pytest.mark.asyncio
+    async def test_deploy_accepts_2xx_variants(self) -> None:
+        """Some publish responses are 202/204 depending on server side."""
+        for status in (201, 202, 204):
+            session = _make_session()
+            _install_ctx(session.post, _mock_response(status=status, body_text=""))
+            creator = DialogsSkillCreator(session)
+            await creator.request_deploy("csrf", "skill-1")  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# list_existing_skills
+# ---------------------------------------------------------------------------
+
+
+class TestListExistingSkills:
+    """GET /snapshot — returns existing skills; raises DialogsApiError on malformed JSON."""
+
+    @pytest.mark.asyncio
+    async def test_returns_skill_dicts(self) -> None:
+        """Snapshot is parsed into a list of skill dicts."""
+        session = _make_session()
+        _install_ctx(
+            session.get,
+            _mock_response(
+                status=200,
+                body_json={
+                    "result": {
+                        "skills": [
+                            {"id": "s1", "name": "First"},
+                            {"id": "s2", "name": "Second"},
+                        ]
+                    }
+                },
+            ),
+        )
+        creator = DialogsSkillCreator(session)
+
+        skills = await creator.list_existing_skills("csrf")
+        assert len(skills) == 2
+        assert skills[0]["name"] == "First"
+
+    @pytest.mark.asyncio
+    async def test_raises_when_malformed(self) -> None:
+        """Non-JSON snapshot body is a protocol break — raise instead of hiding it."""
+        session = _make_session()
+        _install_ctx(session.get, _mock_response(status=200, body_text="not json"))
+        creator = DialogsSkillCreator(session)
+
+        with pytest.raises(DialogsApiError):
+            await creator.list_existing_skills("csrf")
+
+
+# ---------------------------------------------------------------------------
+# Payload builders (pure functions)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildSmartHomeDraftPayload:
+    """build_smart_home_draft_payload — Smart Home draft body."""
+
+    def test_returns_dict_with_required_keys(self) -> None:
+        """Payload contains every key Yandex's validator expects."""
+        payload = build_smart_home_draft_payload(
+            skill_name="Music Assistant",
+            backend_uri="https://yaha-cloud.ru/api/yandex_smart_home",
+            logo_id="be043706-a868-4999-83c8-f17bbd60745d",
+            developer_name="alice",
+        )
+        for key in ("name", "logoId", "backendSettings", "publishingSettings", "channel"):
+            assert key in payload
+        assert payload["name"] == "Music Assistant"
+        assert payload["logoId"] == "be043706-a868-4999-83c8-f17bbd60745d"
+        assert payload["backendSettings"]["uri"] == "https://yaha-cloud.ru/api/yandex_smart_home"
+        assert payload["publishingSettings"]["category"] == "smart_home"
+        assert payload["publishingSettings"]["developerName"] == "alice"
+        assert payload["channel"] == "smartHome"
+
+    def test_logo_id_can_be_none(self) -> None:
+        """Skipping the logo step still produces a valid (logoId-less) draft."""
+        payload = build_smart_home_draft_payload(
+            skill_name="x",
+            backend_uri="https://x.test/api",
+            logo_id=None,
+        )
+        assert payload["logoId"] is None
+
+
+class TestBuildDialogDraftPayload:
+    """build_dialog_draft_payload — Alice custom-skill draft body."""
+
+    def test_required_fields(self) -> None:
+        """Description is mandatory; structuredExamples + activationPhrases get sane defaults."""
+        payload = build_dialog_draft_payload(
+            skill_name="My Skill",
+            backend_uri="https://x.test/webhook",
+            logo_id=None,
+            description="Voice control demo skill.",
+        )
+        assert payload["name"] == "My Skill"
+        assert payload["channel"] == "aliceSkill"
+        assert payload["activationPhrases"] == ["My Skill"]
+        assert payload["publishingSettings"]["description"] == "Voice control demo skill."
+        assert len(payload["publishingSettings"]["structuredExamples"]) >= 1
+        # Default category and voice
+        assert payload["publishingSettings"]["category"] == "music_audio"
+        assert payload["voice"] == "good_oksana"
+
+    def test_overrides_for_examples_and_phrases(self) -> None:
+        """Caller can override examples/phrases/category/voice."""
+        examples = [
+            {
+                "marker": "попроси",
+                "activationPhrase": "X",
+                "request": "включи джаз",
+                "is_valid": True,
+            },
+        ]
+        payload = build_dialog_draft_payload(
+            skill_name="X",
+            backend_uri="https://x.test/y",
+            logo_id="abc",
+            description="d",
+            structured_examples=examples,
+            activation_phrases=["X", "Х"],
+            category="other",
+            voice="alyss",
+        )
+        assert payload["publishingSettings"]["structuredExamples"] == examples
+        assert payload["activationPhrases"] == ["X", "Х"]
+        assert payload["publishingSettings"]["category"] == "other"
+        assert payload["voice"] == "alyss"
+
+
+class TestBuildOAuthAppPayload:
+    """build_oauth_app_payload round-trips the OAuth app fields."""
+
+    def test_round_trips_fields(self) -> None:
+        payload = build_oauth_app_payload(
+            skill_name="Music Assistant",
+            client_id="https://social.yandex.net/",
+            client_secret="abc123deadbeef",
+            authorize_url="https://x.test/auth/authorize",
+            token_url="https://x.test/auth/token",
+        )
+        assert payload == {
+            "name": "Music Assistant",
+            "clientId": "https://social.yandex.net/",
+            "clientSecret": "abc123deadbeef",
+            "authorizationUrl": "https://x.test/auth/authorize",
+            "tokenUrl": "https://x.test/auth/token",
+            "refreshTokenUrl": "https://x.test/auth/token",
+            "scope": "",
+            "yandexClientId": "",
+        }
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator: auto_create_skill / auto_rename_dialog_skill
+# ---------------------------------------------------------------------------
+
+
+def _make_creator_mock() -> AsyncMock:
+    """Build an AsyncMock DialogsSkillCreator with all-success defaults."""
+    creator = AsyncMock(spec=DialogsSkillCreator)
+    creator.fetch_csrf.return_value = "csrf-token"
+    creator.create_app.return_value = "skill-id-123"
+    creator.upload_logo.return_value = "logo-id-456"
+    creator.update_draft.return_value = None
+    creator.create_oauth_app.return_value = "oauth-app-id-789"
+    creator.attach_oauth.return_value = None
+    creator.request_deploy.return_value = None
+    return creator
+
+
+def _fake_authenticator(session: aiohttp.ClientSession | MagicMock | None = None) -> Any:
+    """Build a no-arg async-context-manager factory yielding *session*.
+
+    Matches the ``AuthenticatorCM`` Protocol the lib expects. If *session*
+    is None, yields a MagicMock spec'd against aiohttp.ClientSession.
+    """
+    if session is None:
+        session = MagicMock(spec=aiohttp.ClientSession)
+
+    @asynccontextmanager
+    async def _cm() -> AsyncIterator[aiohttp.ClientSession]:
+        yield session
+
+    def _factory() -> Any:
+        return _cm()
+
+    return _factory
+
+
+async def _run_orch(
+    *,
+    creator: AsyncMock,
+    artifacts: SkillCreationArtifacts | None = None,
+    progress_cb: Any = None,
+    skill_type: str = "smart_home",
+    dialog_description: str | None = None,
+) -> SkillCreationArtifacts:
+    """Run auto_create_skill with fake authenticator + injected creator."""
+    return await auto_create_skill(
+        authenticator=_fake_authenticator(),
+        skill_name="Test Skill",
+        artifacts=artifacts if artifacts is not None else SkillCreationArtifacts(),
+        backend_uri=_TEST_BACKEND_URI,
+        oauth_authorize_url=_TEST_AUTH_AUTHORIZE_URL,
+        oauth_token_url=_TEST_AUTH_TOKEN_URL,
+        oauth_client_id=_TEST_OAUTH_CLIENT_ID,
+        oauth_client_secret=_TEST_OAUTH_CLIENT_SECRET,
+        logo_bytes=b"\x89PNG fake",
+        skill_type=skill_type,  # type: ignore[arg-type]
+        dialog_description=dialog_description,
+        creator_factory=lambda _session: creator,
+        progress_cb=progress_cb,
+    )
+
+
+class TestAutoCreateSkillHappyPath:
+    """auto_create_skill end-to-end: each pipeline step runs in order."""
+
+    @pytest.mark.asyncio
+    async def test_smart_home_pipeline_runs_all_steps(self) -> None:
+        """All 5 pipeline calls happen and final state is DONE."""
+        creator = _make_creator_mock()
+        result = await _run_orch(creator=creator)
+        assert result.state == SkillCreationState.DONE
+        assert result.skill_id == "skill-id-123"
+        assert result.logo_id == "logo-id-456"
+        assert result.oauth_app_id == "oauth-app-id-789"
+        assert result.last_error is None
+        creator.fetch_csrf.assert_awaited_once()
+        creator.create_app.assert_awaited_once_with("csrf-token", "Test Skill")
+        creator.upload_logo.assert_awaited_once()
+        creator.update_draft.assert_awaited_once()
+        creator.create_oauth_app.assert_awaited_once()
+        creator.attach_oauth.assert_awaited_once()
+        creator.request_deploy.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_progress_cb_called_per_state_transition(self) -> None:
+        """progress_cb fires at every state checkpoint."""
+        states_seen: list[SkillCreationState] = []
+
+        async def _cb(art: SkillCreationArtifacts) -> None:
+            states_seen.append(art.state)
+
+        result = await _run_orch(creator=_make_creator_mock(), progress_cb=_cb)
+        assert result.state == SkillCreationState.DONE
+        # Should see APP_CREATED, DRAFT_UPDATED, OAUTH_CREATED, OAUTH_ATTACHED,
+        # DEPLOY_REQUESTED, DONE.
+        assert SkillCreationState.APP_CREATED in states_seen
+        assert SkillCreationState.DRAFT_UPDATED in states_seen
+        assert SkillCreationState.OAUTH_CREATED in states_seen
+        assert SkillCreationState.OAUTH_ATTACHED in states_seen
+        assert SkillCreationState.DEPLOY_REQUESTED in states_seen
+        assert states_seen[-1] == SkillCreationState.DONE
+
+
+class TestAutoCreateSkillResume:
+    """Pipeline skips already-completed steps when given partial artifacts."""
+
+    @pytest.mark.asyncio
+    async def test_resume_from_app_created_skips_create(self) -> None:
+        """Resuming from APP_CREATED skips create_app."""
+        creator = _make_creator_mock()
+        artifacts = SkillCreationArtifacts(
+            state=SkillCreationState.APP_CREATED,
+            skill_id="existing-skill",
+        )
+        result = await _run_orch(creator=creator, artifacts=artifacts)
+        assert result.state == SkillCreationState.DONE
+        assert result.skill_id == "existing-skill"  # not overwritten
+        creator.create_app.assert_not_awaited()
+        creator.upload_logo.assert_awaited_once()
+        creator.update_draft.assert_awaited_once()
+        creator.request_deploy.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_resume_from_oauth_attached_only_publishes(self) -> None:
+        """Resuming from OAUTH_ATTACHED only runs request_deploy."""
+        creator = _make_creator_mock()
+        artifacts = SkillCreationArtifacts(
+            state=SkillCreationState.OAUTH_ATTACHED,
+            skill_id="x",
+            logo_id="y",
+            oauth_app_id="z",
+        )
+        result = await _run_orch(creator=creator, artifacts=artifacts)
+        assert result.state == SkillCreationState.DONE
+        creator.create_app.assert_not_awaited()
+        creator.upload_logo.assert_not_awaited()
+        creator.update_draft.assert_not_awaited()
+        creator.create_oauth_app.assert_not_awaited()
+        creator.attach_oauth.assert_not_awaited()
+        creator.request_deploy.assert_awaited_once()
+
+
+class TestAutoCreateSkillFailure:
+    """Pipeline failures surface as FAILED artifacts with last_error."""
+
+    @pytest.mark.asyncio
+    async def test_create_app_failure_returns_failed(self) -> None:
+        """A DialogsApiError mid-pipeline returns FAILED artifacts (no raise)."""
+        creator = _make_creator_mock()
+        creator.create_app.side_effect = DialogsApiError(
+            "duplicate", step="create_app", http_status=409
+        )
+        result = await _run_orch(creator=creator)
+        assert result.state == SkillCreationState.FAILED
+        assert result.last_error is not None
+        assert "duplicate" in result.last_error
+        creator.upload_logo.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_partial_progress_preserved_on_failure(self) -> None:
+        """If draft fails after the app step, the FAILED artifacts retain skill_id.
+
+        Note: logo_id is intentionally only checkpointed together with the
+        DRAFT_UPDATED transition — the logo+draft pair is treated as a single
+        atomic step so a partially-uploaded skill always retries the
+        logo+draft together. skill_id, oauth_app_id are persisted independently.
+        """
+        creator = _make_creator_mock()
+        creator.update_draft.side_effect = DialogsApiError(
+            "patch failed", step="update_draft", http_status=500
+        )
+        result = await _run_orch(creator=creator)
+        assert result.state == SkillCreationState.FAILED
+        assert result.skill_id == "skill-id-123"
+        assert result.oauth_app_id is None  # never reached
+
+
+class TestAutoCreateSkillDialogType:
+    """skill_type='dialog' uses the aliceSkill channel + dialog draft payload."""
+
+    @pytest.mark.asyncio
+    async def test_dialog_requires_description(self) -> None:
+        """Empty description → FAILED with explicit message, no API calls."""
+        creator = _make_creator_mock()
+        result = await _run_orch(creator=creator, skill_type="dialog", dialog_description=None)
+        assert result.state == SkillCreationState.FAILED
+        assert result.last_error is not None
+        assert "dialog_description" in result.last_error
+        creator.fetch_csrf.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_dialog_full_pipeline_uses_dialog_payload(self) -> None:
+        """Dialog skill_type runs end-to-end with the right payload shape."""
+        creator = _make_creator_mock()
+        result = await _run_orch(
+            creator=creator,
+            skill_type="dialog",
+            dialog_description=_TEST_DIALOG_DESCRIPTION,
+        )
+        assert result.state == SkillCreationState.DONE
+        # update_draft was called with the dialog payload (channel=aliceSkill).
+        update_call = creator.update_draft.await_args
+        assert update_call is not None
+        payload = (
+            update_call.args[2] if len(update_call.args) >= 3 else update_call.kwargs.get("payload")
+        )
+        assert payload["channel"] == "aliceSkill"
+        assert payload["publishingSettings"]["description"] == _TEST_DIALOG_DESCRIPTION
+
+
+class TestAuthenticatorRequired:
+    """authenticator is a required parameter — no default."""
+
+    @pytest.mark.asyncio
+    async def test_authenticator_session_passed_to_creator(self) -> None:
+        """The session yielded by the authenticator is passed to creator_factory."""
+        session = MagicMock(spec=aiohttp.ClientSession)
+        captured: list[Any] = []
+
+        def _factory(s: Any) -> Any:
+            captured.append(s)
+            return _make_creator_mock()
+
+        await auto_create_skill(
+            authenticator=_fake_authenticator(session),
+            skill_name="x",
+            artifacts=SkillCreationArtifacts(),
+            backend_uri=_TEST_BACKEND_URI,
+            oauth_authorize_url=_TEST_AUTH_AUTHORIZE_URL,
+            oauth_token_url=_TEST_AUTH_TOKEN_URL,
+            oauth_client_id=_TEST_OAUTH_CLIENT_ID,
+            oauth_client_secret=_TEST_OAUTH_CLIENT_SECRET,
+            logo_bytes=b"\x89PNG",
+            creator_factory=_factory,
+        )
+        assert captured == [session]
+
+
+class TestAutoRenameDialogSkill:
+    """auto_rename_dialog_skill patches the draft and re-deploys."""
+
+    @pytest.mark.asyncio
+    async def test_happy_path(self) -> None:
+        """Rename produces DONE state with the new last_known_name."""
+        creator = _make_creator_mock()
+        artifacts = SkillCreationArtifacts(
+            state=SkillCreationState.DONE,
+            skill_id="sk-1",
+            logo_id="lg-1",
+            last_known_name="Old Name",
+        )
+        result = await auto_rename_dialog_skill(
+            authenticator=_fake_authenticator(),
+            artifacts=artifacts,
+            new_name="New Name",
+            backend_uri=_TEST_DIALOG_BACKEND_URI,
+            description="A skill with a new name.",
+            creator_factory=lambda _s: creator,
+        )
+        assert result.state == SkillCreationState.DONE
+        assert result.last_known_name == "New Name"
+        assert result.last_error is None
+        creator.update_draft.assert_awaited_once()
+        creator.request_deploy.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_missing_skill_id_returns_failed_immediately(self) -> None:
+        """Renaming an uncreated skill is a no-op error, not a crash."""
+        result = await auto_rename_dialog_skill(
+            authenticator=_fake_authenticator(),
+            artifacts=SkillCreationArtifacts(),  # no skill_id
+            new_name="Whatever",
+            backend_uri=_TEST_DIALOG_BACKEND_URI,
+            description="d",
+        )
+        assert result.state == SkillCreationState.FAILED
+        assert result.last_error is not None
+        assert "skill_id" in result.last_error
+
+    @pytest.mark.asyncio
+    async def test_dialogs_api_error_returns_failed(self) -> None:
+        """A DialogsApiError during rename produces FAILED, not a raise."""
+        creator = _make_creator_mock()
+        creator.update_draft.side_effect = DialogsApiError(
+            "moderation rejected", step="update_draft", http_status=400
+        )
+        artifacts = SkillCreationArtifacts(
+            state=SkillCreationState.DONE,
+            skill_id="sk-1",
+            logo_id="lg-1",
+        )
+        result = await auto_rename_dialog_skill(
+            authenticator=_fake_authenticator(),
+            artifacts=artifacts,
+            new_name="N",
+            backend_uri=_TEST_DIALOG_BACKEND_URI,
+            description="d",
+            creator_factory=lambda _s: creator,
+        )
+        assert result.state == SkillCreationState.FAILED
+        assert result.last_error is not None
+        assert "moderation" in result.last_error
+
+
+class TestLoadDefaultLogoBytes:
+    """load_default_logo_bytes reads the bundled PNG from package resources."""
+
+    def test_returns_real_png(self) -> None:
+        """Bundled assets/default_logo.png exists and has a PNG magic header."""
+        data = load_default_logo_bytes()
+        # PNG magic: 89 50 4E 47 0D 0A 1A 0A
+        assert data[:8] == bytes.fromhex("89504e470d0a1a0a")
+        # Sanity: the bundled asset is non-trivial, not the 1x1 fallback.
+        assert len(data) > 1000, f"expected real logo asset, got {len(data)} bytes (fallback?)"

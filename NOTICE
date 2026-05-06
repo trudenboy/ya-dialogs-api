@@ -1,0 +1,29 @@
+ya-dialogs-api
+Copyright (c) 2026 Mikhail Nevskiy
+
+This library implements a client for the Yandex Dialogs Developer API
+(`dialogs.yandex.ru/developer-api/v2/`). The API is undocumented and
+private — the request shapes, endpoint paths, CSRF extraction pattern,
+and pipeline ordering were captured from Chrome DevTools HAR files
+during interactive sessions with the Yandex developer console.
+
+This product includes software originally developed as part of the
+ma-provider-yandex-smarthome Music Assistant plugin:
+
+    ma-provider-yandex-smarthome
+    Copyright (c) 2025-2026 Mikhail Nevskiy
+    https://github.com/trudenboy/ma-provider-yandex-smarthome
+    Licensed under the MIT License
+
+The skill auto-creation pipeline (Device Flow OAuth → CSRF/cookie session
+→ POST /apps → POST /skills/{id}/draft → publication polling) was
+extracted from `provider/auto_skill.py` of that project and made
+framework-agnostic for general use.
+
+The default skill logo asset (`src/ya_dialogs_api/assets/default_logo.png`)
+is also drawn from that upstream project.
+
+This library uses ya-passport-auth (https://github.com/trudenboy/ya-passport-auth)
+for the Yandex Passport authentication side of the flow. ya-passport-auth
+in turn re-implements work originally derived from AlexxIT/YandexStation;
+see ya-passport-auth's NOTICE for that upstream attribution.
