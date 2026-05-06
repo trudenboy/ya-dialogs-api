@@ -14,21 +14,27 @@ import aiohttp
 import pytest
 
 from ya_dialogs_api import (
+    DIALOG_CHANNEL,
     DIALOGS_API_BASE,
     DIALOGS_DEV_HTML_URL,
+    SMART_HOME_CHANNEL,
     DialogsApiError,
+    DialogsAuthError,
     DialogsCsrfError,
     DialogsDuplicateSkillError,
     DialogsSkillCreator,
+    DialogsSkillNotFoundError,
+    DialogsValidationError,
     SkillCreationArtifacts,
     SkillCreationState,
     auto_create_skill,
-    auto_rename_dialog_skill,
+    auto_update_skill,
     build_dialog_draft_payload,
     build_oauth_app_payload,
     build_smart_home_draft_payload,
     load_default_logo_bytes,
 )
+from ya_dialogs_api.errors import parse_error_body
 
 # Pre-computed URLs / OAuth params used by orchestrator tests.
 # (Replaces the smarthome connection-type derivation that lived inside the lib.)
@@ -111,7 +117,7 @@ class TestFetchCsrf:
         token = await creator.fetch_csrf()
         assert token == "u9c94f1aca53bf156be4abc"
         # Verify we hit the expected URL
-        session.get.assert_called_once_with(DIALOGS_DEV_HTML_URL)
+        session.get.assert_called_once_with(DIALOGS_DEV_HTML_URL, allow_redirects=False)
 
     @pytest.mark.asyncio
     async def test_regex_miss_raises_csrf_error(self) -> None:
@@ -599,10 +605,10 @@ async def _run_orch(
     creator: AsyncMock,
     artifacts: SkillCreationArtifacts | None = None,
     progress_cb: Any = None,
-    skill_type: str = "smart_home",
-    dialog_description: str | None = None,
+    channel: str = SMART_HOME_CHANNEL,
+    description: str | None = None,
 ) -> SkillCreationArtifacts:
-    """Run auto_create_skill with fake authenticator + injected creator."""
+    """Run auto_create_skill (smart_home, with OAuth) — fake authenticator + injected creator."""
     return await auto_create_skill(
         authenticator=_fake_authenticator(),
         skill_name="Test Skill",
@@ -613,8 +619,8 @@ async def _run_orch(
         oauth_client_id=_TEST_OAUTH_CLIENT_ID,
         oauth_client_secret=_TEST_OAUTH_CLIENT_SECRET,
         logo_bytes=b"\x89PNG fake",
-        skill_type=skill_type,  # type: ignore[arg-type]
-        dialog_description=dialog_description,
+        channel=channel,  # type: ignore[arg-type]
+        description=description,
         creator_factory=lambda _session: creator,
         progress_cb=progress_cb,
     )
@@ -681,6 +687,27 @@ class TestAutoCreateSkillResume:
         creator.request_deploy.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_resume_from_failed_with_skill_id_does_not_recreate(self) -> None:
+        """Retry after FAILED with existing skill_id must not call create_app again.
+
+        Otherwise callers persisting artifacts and retrying would create
+        duplicate skills on every transient failure.
+        """
+        creator = _make_creator_mock()
+        artifacts = SkillCreationArtifacts(
+            state=SkillCreationState.FAILED,
+            skill_id="already-created",
+            last_error="prev attempt died at logo upload",
+        )
+        result = await _run_orch(creator=creator, artifacts=artifacts)
+        assert result.state == SkillCreationState.DONE
+        assert result.skill_id == "already-created"  # ID preserved, not overwritten
+        creator.create_app.assert_not_awaited()
+        creator.upload_logo.assert_awaited_once()
+        creator.update_draft.assert_awaited_once()
+        creator.request_deploy.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_resume_from_oauth_attached_only_publishes(self) -> None:
         """Resuming from OAUTH_ATTACHED only runs request_deploy."""
         creator = _make_creator_mock()
@@ -735,27 +762,37 @@ class TestAutoCreateSkillFailure:
         assert result.oauth_app_id is None  # never reached
 
 
-class TestAutoCreateSkillDialogType:
-    """skill_type='dialog' uses the aliceSkill channel + dialog draft payload."""
+class TestAutoCreateSkillDialogChannel:
+    """channel='aliceSkill' with OAuth attached — symmetric to smart_home but dialog payload."""
 
     @pytest.mark.asyncio
     async def test_dialog_requires_description(self) -> None:
         """Empty description → FAILED with explicit message, no API calls."""
         creator = _make_creator_mock()
-        result = await _run_orch(creator=creator, skill_type="dialog", dialog_description=None)
+        result = await _run_orch(creator=creator, channel=DIALOG_CHANNEL, description=None)
         assert result.state == SkillCreationState.FAILED
         assert result.last_error is not None
-        assert "dialog_description" in result.last_error
+        assert "description" in result.last_error
+        creator.fetch_csrf.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_dialog_whitespace_description_returns_failed(self) -> None:
+        """Whitespace-only description → FAILED before any API call."""
+        creator = _make_creator_mock()
+        result = await _run_orch(creator=creator, channel=DIALOG_CHANNEL, description="   \t\n  ")
+        assert result.state == SkillCreationState.FAILED
+        assert result.last_error is not None
+        assert "description" in result.last_error
         creator.fetch_csrf.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_dialog_full_pipeline_uses_dialog_payload(self) -> None:
-        """Dialog skill_type runs end-to-end with the right payload shape."""
+        """channel='aliceSkill' runs end-to-end with the right payload shape."""
         creator = _make_creator_mock()
         result = await _run_orch(
             creator=creator,
-            skill_type="dialog",
-            dialog_description=_TEST_DIALOG_DESCRIPTION,
+            channel=DIALOG_CHANNEL,
+            description=_TEST_DIALOG_DESCRIPTION,
         )
         assert result.state == SkillCreationState.DONE
         # update_draft was called with the dialog payload (channel=aliceSkill).
@@ -796,12 +833,218 @@ class TestAuthenticatorRequired:
         assert captured == [session]
 
 
-class TestAutoRenameDialogSkill:
-    """auto_rename_dialog_skill patches the draft and re-deploys."""
+async def _run_dialog_orch(
+    *,
+    creator: AsyncMock,
+    artifacts: SkillCreationArtifacts | None = None,
+    progress_cb: Any = None,
+    description: str = _TEST_DIALOG_DESCRIPTION,
+    logo_bytes: bytes | None = b"\x89PNG fake",
+) -> SkillCreationArtifacts:
+    """Run auto_create_skill(channel='aliceSkill', no oauth_*) — OAuth-free dialog pipeline."""
+    return await auto_create_skill(
+        authenticator=_fake_authenticator(),
+        skill_name="Test Dialog Skill",
+        artifacts=artifacts if artifacts is not None else SkillCreationArtifacts(),
+        backend_uri=_TEST_DIALOG_BACKEND_URI,
+        channel=DIALOG_CHANNEL,
+        description=description,
+        logo_bytes=logo_bytes,
+        creator_factory=lambda _session: creator,
+        progress_cb=progress_cb,
+    )
+
+
+class TestAutoCreateDialogSkillHappyPath:
+    """auto_create_skill(channel='aliceSkill') without OAuth: runs the 4-step pipeline."""
 
     @pytest.mark.asyncio
-    async def test_happy_path(self) -> None:
-        """Rename produces DONE state with the new last_known_name."""
+    async def test_runs_create_logo_draft_deploy_no_oauth(self) -> None:
+        """All 4 OAuth-free steps run; OAuth methods never called; final state DONE."""
+        creator = _make_creator_mock()
+        result = await _run_dialog_orch(creator=creator)
+        assert result.state == SkillCreationState.DONE
+        assert result.skill_id == "skill-id-123"
+        assert result.logo_id == "logo-id-456"
+        assert result.last_known_name == "Test Dialog Skill"
+        assert result.last_error is None
+        # OAuth-free: oauth_app_id never populated
+        assert result.oauth_app_id is None
+        creator.fetch_csrf.assert_awaited_once()
+        creator.create_app.assert_awaited_once_with("csrf-token", "Test Dialog Skill")
+        creator.upload_logo.assert_awaited_once()
+        creator.update_draft.assert_awaited_once()
+        creator.request_deploy.assert_awaited_once()
+        # Critical: OAuth methods MUST NOT be called for dialog skills.
+        creator.create_oauth_app.assert_not_awaited()
+        creator.attach_oauth.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_progress_cb_called_per_state_transition(self) -> None:
+        """progress_cb fires at every state checkpoint; no OAuth states emitted."""
+        states_seen: list[SkillCreationState] = []
+
+        async def _cb(art: SkillCreationArtifacts) -> None:
+            states_seen.append(art.state)
+
+        result = await _run_dialog_orch(creator=_make_creator_mock(), progress_cb=_cb)
+        assert result.state == SkillCreationState.DONE
+        assert SkillCreationState.APP_CREATED in states_seen
+        assert SkillCreationState.DRAFT_UPDATED in states_seen
+        assert SkillCreationState.DEPLOY_REQUESTED in states_seen
+        assert states_seen[-1] == SkillCreationState.DONE
+        # OAuth-free flow never touches OAuth_* states.
+        assert SkillCreationState.OAUTH_CREATED not in states_seen
+        assert SkillCreationState.OAUTH_ATTACHED not in states_seen
+
+    @pytest.mark.asyncio
+    async def test_update_draft_uses_alice_skill_channel_payload(self) -> None:
+        """update_draft is invoked with the aliceSkill channel payload."""
+        creator = _make_creator_mock()
+        await _run_dialog_orch(creator=creator)
+        update_call = creator.update_draft.await_args
+        assert update_call is not None
+        payload = (
+            update_call.args[2] if len(update_call.args) >= 3 else update_call.kwargs.get("payload")
+        )
+        assert payload["channel"] == "aliceSkill"
+        assert payload["publishingSettings"]["description"] == _TEST_DIALOG_DESCRIPTION
+
+
+class TestAutoCreateDialogSkillResume:
+    """Pipeline skips already-completed steps when given partial artifacts."""
+
+    @pytest.mark.asyncio
+    async def test_resume_from_app_created_skips_create(self) -> None:
+        """Resuming from APP_CREATED skips create_app; runs logo+draft+deploy."""
+        creator = _make_creator_mock()
+        artifacts = SkillCreationArtifacts(
+            state=SkillCreationState.APP_CREATED,
+            skill_id="existing-skill",
+        )
+        result = await _run_dialog_orch(creator=creator, artifacts=artifacts)
+        assert result.state == SkillCreationState.DONE
+        assert result.skill_id == "existing-skill"  # not overwritten
+        creator.create_app.assert_not_awaited()
+        creator.upload_logo.assert_awaited_once()
+        creator.update_draft.assert_awaited_once()
+        creator.request_deploy.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_resume_from_draft_updated_only_publishes(self) -> None:
+        """Resuming from DRAFT_UPDATED checkpoints DEPLOY_REQUESTED + publishes only."""
+        creator = _make_creator_mock()
+        artifacts = SkillCreationArtifacts(
+            state=SkillCreationState.DRAFT_UPDATED,
+            skill_id="existing-skill",
+            logo_id="existing-logo",
+        )
+        result = await _run_dialog_orch(creator=creator, artifacts=artifacts)
+        assert result.state == SkillCreationState.DONE
+        creator.create_app.assert_not_awaited()
+        creator.upload_logo.assert_not_awaited()
+        creator.update_draft.assert_not_awaited()
+        creator.request_deploy.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_resume_from_deploy_requested_only_publishes(self) -> None:
+        """Resuming from DEPLOY_REQUESTED only runs request_deploy."""
+        creator = _make_creator_mock()
+        artifacts = SkillCreationArtifacts(
+            state=SkillCreationState.DEPLOY_REQUESTED,
+            skill_id="existing-skill",
+            logo_id="existing-logo",
+        )
+        result = await _run_dialog_orch(creator=creator, artifacts=artifacts)
+        assert result.state == SkillCreationState.DONE
+        creator.create_app.assert_not_awaited()
+        creator.upload_logo.assert_not_awaited()
+        creator.update_draft.assert_not_awaited()
+        creator.request_deploy.assert_awaited_once()
+
+
+class TestAutoCreateDialogSkillFailure:
+    """Failures surface as FAILED artifacts with last_error."""
+
+    @pytest.mark.asyncio
+    async def test_empty_description_returns_failed_no_network(self) -> None:
+        """Empty description short-circuits to FAILED before any API call."""
+        creator = _make_creator_mock()
+        result = await _run_dialog_orch(creator=creator, description="")
+        assert result.state == SkillCreationState.FAILED
+        assert result.last_error is not None
+        assert "description" in result.last_error
+        creator.fetch_csrf.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_create_app_failure_returns_failed(self) -> None:
+        """A DialogsApiError mid-pipeline returns FAILED, not a raise."""
+        creator = _make_creator_mock()
+        creator.create_app.side_effect = DialogsApiError(
+            "boom",
+            step="create_app",
+            http_status=500,
+        )
+        result = await _run_dialog_orch(creator=creator)
+        assert result.state == SkillCreationState.FAILED
+        assert result.last_error is not None
+        assert "boom" in result.last_error
+        creator.upload_logo.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_duplicate_skill_returns_failed(self) -> None:
+        """DialogsDuplicateSkillError surfaces as FAILED with last_error preserved."""
+        creator = _make_creator_mock()
+        creator.create_app.side_effect = DialogsDuplicateSkillError(
+            "Skill name is already taken",
+            step="create_app",
+            http_status=409,
+        )
+        result = await _run_dialog_orch(creator=creator)
+        assert result.state == SkillCreationState.FAILED
+        assert result.last_error is not None
+        assert "already taken" in result.last_error
+
+    @pytest.mark.asyncio
+    async def test_partial_progress_preserved_on_deploy_failure(self) -> None:
+        """If request_deploy fails, FAILED artifacts retain skill_id + logo_id."""
+        creator = _make_creator_mock()
+        creator.request_deploy.side_effect = DialogsApiError(
+            "deploy failed",
+            step="request_deploy",
+            http_status=500,
+        )
+        result = await _run_dialog_orch(creator=creator)
+        assert result.state == SkillCreationState.FAILED
+        assert result.skill_id == "skill-id-123"
+        assert result.logo_id == "logo-id-456"
+
+
+class TestAutoCreateDialogSkillDefaults:
+    """Default parameter behaviour."""
+
+    @pytest.mark.asyncio
+    async def test_default_logo_bytes_loaded_when_none(self) -> None:
+        """logo_bytes=None triggers load_default_logo_bytes."""
+        creator = _make_creator_mock()
+        result = await _run_dialog_orch(creator=creator, logo_bytes=None)
+        assert result.state == SkillCreationState.DONE
+        upload_call = creator.upload_logo.await_args
+        assert upload_call is not None
+        png_arg = (
+            upload_call.args[2] if len(upload_call.args) >= 3 else upload_call.kwargs.get("png")
+        )
+        assert isinstance(png_arg, bytes)
+        # PNG magic header (real bundled asset or 1x1 fallback both start with this)
+        assert png_arg[:8] == bytes.fromhex("89504e470d0a1a0a")
+
+
+class TestAutoUpdateSkill:
+    """auto_update_skill patches the draft and re-deploys for both channels."""
+
+    @pytest.mark.asyncio
+    async def test_smart_home_happy_path(self) -> None:
+        """smartHome update produces DONE with new name and a smartHome-shaped payload."""
         creator = _make_creator_mock()
         artifacts = SkillCreationArtifacts(
             state=SkillCreationState.DONE,
@@ -809,37 +1052,80 @@ class TestAutoRenameDialogSkill:
             logo_id="lg-1",
             last_known_name="Old Name",
         )
-        result = await auto_rename_dialog_skill(
+        result = await auto_update_skill(
             authenticator=_fake_authenticator(),
             artifacts=artifacts,
-            new_name="New Name",
-            backend_uri=_TEST_DIALOG_BACKEND_URI,
-            description="A skill with a new name.",
+            skill_name="New Smart Home Name",
+            backend_uri=_TEST_BACKEND_URI,
+            channel=SMART_HOME_CHANNEL,
             creator_factory=lambda _s: creator,
         )
         assert result.state == SkillCreationState.DONE
-        assert result.last_known_name == "New Name"
+        assert result.last_known_name == "New Smart Home Name"
         assert result.last_error is None
         creator.update_draft.assert_awaited_once()
         creator.request_deploy.assert_awaited_once()
+        # smartHome payload shape: has publishingSettings.category="smart_home"
+        sent_payload = creator.update_draft.await_args.args[2]
+        assert sent_payload["channel"] == SMART_HOME_CHANNEL
+        assert sent_payload["name"] == "New Smart Home Name"
+        assert "structuredExamples" not in sent_payload.get("publishingSettings", {})
+
+    @pytest.mark.asyncio
+    async def test_dialog_happy_path(self) -> None:
+        """aliceSkill update produces DONE; payload carries description."""
+        creator = _make_creator_mock()
+        artifacts = SkillCreationArtifacts(
+            state=SkillCreationState.DONE,
+            skill_id="sk-1",
+            logo_id="lg-1",
+        )
+        result = await auto_update_skill(
+            authenticator=_fake_authenticator(),
+            artifacts=artifacts,
+            skill_name="New Dialog Name",
+            backend_uri=_TEST_DIALOG_BACKEND_URI,
+            channel=DIALOG_CHANNEL,
+            description="A dialog skill description.",
+            creator_factory=lambda _s: creator,
+        )
+        assert result.state == SkillCreationState.DONE
+        assert result.last_known_name == "New Dialog Name"
+        sent_payload = creator.update_draft.await_args.args[2]
+        assert sent_payload["channel"] == DIALOG_CHANNEL
+        assert sent_payload["publishingSettings"]["description"] == "A dialog skill description."
 
     @pytest.mark.asyncio
     async def test_missing_skill_id_returns_failed_immediately(self) -> None:
-        """Renaming an uncreated skill is a no-op error, not a crash."""
-        result = await auto_rename_dialog_skill(
+        """Updating an uncreated skill is a no-op error, not a crash."""
+        result = await auto_update_skill(
             authenticator=_fake_authenticator(),
             artifacts=SkillCreationArtifacts(),  # no skill_id
-            new_name="Whatever",
-            backend_uri=_TEST_DIALOG_BACKEND_URI,
-            description="d",
+            skill_name="Whatever",
+            backend_uri=_TEST_BACKEND_URI,
         )
         assert result.state == SkillCreationState.FAILED
         assert result.last_error is not None
         assert "skill_id" in result.last_error
 
     @pytest.mark.asyncio
+    async def test_dialog_empty_description_returns_failed(self) -> None:
+        """aliceSkill requires non-empty description; whitespace alone is rejected."""
+        result = await auto_update_skill(
+            authenticator=_fake_authenticator(),
+            artifacts=SkillCreationArtifacts(skill_id="sk-1", logo_id="lg-1"),
+            skill_name="N",
+            backend_uri=_TEST_DIALOG_BACKEND_URI,
+            channel=DIALOG_CHANNEL,
+            description="   ",
+        )
+        assert result.state == SkillCreationState.FAILED
+        assert result.last_error is not None
+        assert "description" in result.last_error
+
+    @pytest.mark.asyncio
     async def test_dialogs_api_error_returns_failed(self) -> None:
-        """A DialogsApiError during rename produces FAILED, not a raise."""
+        """A DialogsApiError during update produces FAILED, not a raise."""
         creator = _make_creator_mock()
         creator.update_draft.side_effect = DialogsApiError(
             "moderation rejected", step="update_draft", http_status=400
@@ -849,17 +1135,44 @@ class TestAutoRenameDialogSkill:
             skill_id="sk-1",
             logo_id="lg-1",
         )
-        result = await auto_rename_dialog_skill(
+        result = await auto_update_skill(
             authenticator=_fake_authenticator(),
             artifacts=artifacts,
-            new_name="N",
-            backend_uri=_TEST_DIALOG_BACKEND_URI,
-            description="d",
+            skill_name="N",
+            backend_uri=_TEST_BACKEND_URI,
+            channel=SMART_HOME_CHANNEL,
             creator_factory=lambda _s: creator,
         )
         assert result.state == SkillCreationState.FAILED
         assert result.last_error is not None
         assert "moderation" in result.last_error
+
+    @pytest.mark.asyncio
+    async def test_progress_cb_invoked_on_success(self) -> None:
+        """progress_cb fires once with the final DONE artifacts on success."""
+        creator = _make_creator_mock()
+        artifacts = SkillCreationArtifacts(
+            state=SkillCreationState.DONE,
+            skill_id="sk-1",
+            logo_id="lg-1",
+        )
+        snapshots: list[SkillCreationArtifacts] = []
+
+        async def cb(a: SkillCreationArtifacts) -> None:
+            snapshots.append(a)
+
+        result = await auto_update_skill(
+            authenticator=_fake_authenticator(),
+            artifacts=artifacts,
+            skill_name="Updated",
+            backend_uri=_TEST_BACKEND_URI,
+            channel=SMART_HOME_CHANNEL,
+            progress_cb=cb,
+            creator_factory=lambda _s: creator,
+        )
+        assert result.state == SkillCreationState.DONE
+        assert len(snapshots) == 1
+        assert snapshots[0].last_known_name == "Updated"
 
 
 class TestLoadDefaultLogoBytes:
@@ -872,3 +1185,283 @@ class TestLoadDefaultLogoBytes:
         assert data[:8] == bytes.fromhex("89504e470d0a1a0a")
         # Sanity: the bundled asset is non-trivial, not the 1x1 fallback.
         assert len(data) > 1000, f"expected real logo asset, got {len(data)} bytes (fallback?)"
+
+
+# ---------------------------------------------------------------------------
+# delete_skill
+# ---------------------------------------------------------------------------
+
+
+class TestDeleteSkill:
+    """DialogsSkillCreator.delete_skill — DELETE /apps/{id}?channel=..."""
+
+    @pytest.mark.asyncio
+    async def test_delete_smart_home_skill_returns_none(self) -> None:
+        """200 + empty-object body → returns None, channel=smartHome in query string."""
+        session = _make_session()
+        session.delete = MagicMock()
+        _install_ctx(session.delete, _mock_response(status=200, body_text="{}"))
+        creator = DialogsSkillCreator(session, channel=SMART_HOME_CHANNEL)
+        await creator.delete_skill("csrf", "skill-uuid-123")
+        call_args = session.delete.call_args
+        url = call_args.args[0]
+        assert "/apps/skill-uuid-123" in url
+        assert "channel=smartHome" in url
+        assert call_args.kwargs["headers"]["x-csrf-token"] == "csrf"
+
+    @pytest.mark.asyncio
+    async def test_delete_dialog_skill_uses_alice_channel(self) -> None:
+        """channel=aliceSkill in query for dialog skill creator."""
+        session = _make_session()
+        session.delete = MagicMock()
+        _install_ctx(session.delete, _mock_response(status=200, body_text="{}"))
+        creator = DialogsSkillCreator(session, channel=DIALOG_CHANNEL)
+        await creator.delete_skill("csrf", "skill-uuid-456")
+        url = session.delete.call_args.args[0]
+        assert "channel=aliceSkill" in url
+
+    @pytest.mark.asyncio
+    async def test_delete_404_raises_skill_not_found(self) -> None:
+        """Spring 404 'Skill not found' parsed into DialogsSkillNotFoundError."""
+        session = _make_session()
+        session.delete = MagicMock()
+        _install_ctx(
+            session.delete,
+            _mock_response(
+                status=404,
+                body_text=(
+                    '{"servlet":"dispatcherServlet",'
+                    '"message":"Skill not found with id: 12345678-aaaa-bbbb-cccc-1234567890ab",'
+                    '"url":"/api/dev-console/v1/apps/12345678-aaaa-bbbb-cccc-1234567890ab",'
+                    '"status":"404"}'
+                ),
+            ),
+        )
+        creator = DialogsSkillCreator(session, channel=SMART_HOME_CHANNEL)
+        with pytest.raises(DialogsSkillNotFoundError) as exc_info:
+            await creator.delete_skill("csrf", "12345678-aaaa-bbbb-cccc-1234567890ab")
+        assert exc_info.value.skill_id == "12345678-aaaa-bbbb-cccc-1234567890ab"
+        assert exc_info.value.http_status == 404
+
+
+# ---------------------------------------------------------------------------
+# parse_error_body — Spring + domain validation + HTML auth + plain JSON
+# ---------------------------------------------------------------------------
+
+
+class TestParseErrorBody:
+    """Multi-format Yandex error body parser."""
+
+    def test_html_403_returns_auth_error(self) -> None:
+        """HTML 403 ('<!DOCTYPE html>...Forbidden') → DialogsAuthError."""
+        body = (
+            "<!DOCTYPE html>\n<html>\n<head><title>Error</title></head>\n"
+            "<body><pre>Forbidden</pre></body>\n</html>"
+        )
+        err = parse_error_body(body, http_status=403, step="create_app")
+        assert isinstance(err, DialogsAuthError)
+        assert err.http_status == 403
+        assert err.step == "create_app"
+
+    def test_html_401_returns_auth_error(self) -> None:
+        """HTML 401 → DialogsAuthError too."""
+
+        err = parse_error_body("<html>Unauthorized</html>", http_status=401, step="fetch_csrf")
+        assert isinstance(err, DialogsAuthError)
+
+    def test_spring_skill_not_found_returns_typed(self) -> None:
+        """Spring servlet 404 'Skill not found with id: <uuid>' → DialogsSkillNotFoundError."""
+
+        body = (
+            '{"servlet":"dispatcherServlet",'
+            '"message":"Skill not found with id: abc12345-dead-beef-cafe-000000000001",'
+            '"url":"/api/dev-console/v1/apps/abc12345-dead-beef-cafe-000000000001",'
+            '"status":"404"}'
+        )
+        err = parse_error_body(body, http_status=404, step="get_skill")
+        assert isinstance(err, DialogsSkillNotFoundError)
+        assert err.skill_id == "abc12345-dead-beef-cafe-000000000001"
+        assert err.yandex_error is not None
+        assert "Skill not found" in err.yandex_error
+
+    def test_spring_4xx_returns_validation_error(self) -> None:
+        """Spring servlet 4xx (no skill-not-found marker) → DialogsValidationError."""
+
+        body = (
+            '{"servlet":"dispatcherServlet",'
+            '"message":"Required parameter \\u0027channel\\u0027 is not present.",'
+            '"url":"/api/dev-console/v1/apps/x/intents",'
+            '"status":"400"}'
+        )
+        err = parse_error_body(body, http_status=400, step="get_intents")
+        assert isinstance(err, DialogsValidationError)
+        assert err.http_status == 400
+        assert "channel" in (err.yandex_error or "")
+
+    def test_domain_validation_error_with_fields(self) -> None:
+        """Domain shape {error:{message, code, fields:{...}}} → DialogsValidationError + fields."""
+
+        body = (
+            '{"error":{"message":"Validation error","code":400,'
+            '"fields":{"name":"Название должно содержать минимум два слова"}}}'
+        )
+        err = parse_error_body(body, http_status=400, step="update_draft")
+        assert isinstance(err, DialogsValidationError)
+        assert err.fields == {"name": "Название должно содержать минимум два слова"}
+        assert err.yandex_error == "Validation error"
+
+    def test_top_level_error_string(self) -> None:
+        """Plain {error: '...'} → DialogsApiError with yandex_error populated."""
+
+        err = parse_error_body('{"error":"Something bad"}', http_status=500, step="some_step")
+        assert isinstance(err, DialogsApiError)
+        assert not isinstance(err, DialogsValidationError | DialogsAuthError)
+        assert err.yandex_error == "Something bad"
+
+    def test_unknown_body_returns_generic(self) -> None:
+        """Body that isn't recognized → generic DialogsApiError with raw preview."""
+
+        err = parse_error_body("not json at all", http_status=500, step="x")
+        assert type(err) is DialogsApiError
+        assert err.http_status == 500
+
+    def test_empty_body_401_returns_auth_error(self) -> None:
+        """HTTP 401 with empty body → DialogsAuthError (per HTTP semantics)."""
+
+        err = parse_error_body("", http_status=401, step="update_draft")
+        assert isinstance(err, DialogsAuthError)
+        assert err.http_status == 401
+
+    def test_json_body_401_returns_auth_error(self) -> None:
+        """HTTP 401 with JSON body → DialogsAuthError, not generic."""
+
+        err = parse_error_body('{"error":"unauthorized"}', http_status=401, step="x")
+        assert isinstance(err, DialogsAuthError)
+        assert err.http_status == 401
+
+    def test_non_html_403_falls_through(self) -> None:
+        """HTTP 403 with non-HTML JSON body parses through to body-shape rules.
+
+        Yandex uses 403 for both auth-walls (HTML) and domain-level "forbidden"
+        (JSON), so non-HTML 403 must not be auto-classified as auth.
+        """
+        body = '{"error":{"message":"Access denied","code":403}}'
+        err = parse_error_body(body, http_status=403, step="x")
+        assert not isinstance(err, DialogsAuthError)
+
+
+# ---------------------------------------------------------------------------
+# fetch_csrf — auth signals
+# ---------------------------------------------------------------------------
+
+
+class TestFetchCsrfAuthSignals:
+    """fetch_csrf disables redirects and surfaces 30x as DialogsAuthError."""
+
+    @pytest.mark.asyncio
+    async def test_redirect_to_passport_raises_auth_error(self) -> None:
+        """30x (anonymous request) → DialogsAuthError, regex never inspected."""
+        session = _make_session()
+        _install_ctx(session.get, _mock_response(status=302, body_text=""))
+        creator = DialogsSkillCreator(session)
+        with pytest.raises(DialogsAuthError) as exc_info:
+            await creator.fetch_csrf()
+        assert exc_info.value.http_status == 302
+        # Confirm we passed allow_redirects=False
+        session.get.assert_called_once_with(DIALOGS_DEV_HTML_URL, allow_redirects=False)
+
+    @pytest.mark.asyncio
+    async def test_401_raises_auth_error(self) -> None:
+        """401 → DialogsAuthError (was DialogsApiError in 1.0 — now typed)."""
+        session = _make_session()
+        _install_ctx(session.get, _mock_response(status=401, body_text=""))
+        creator = DialogsSkillCreator(session)
+        with pytest.raises(DialogsAuthError) as exc_info:
+            await creator.fetch_csrf()
+        assert exc_info.value.http_status == 401
+
+
+# ---------------------------------------------------------------------------
+# OAuth argument validation in auto_create_skill
+# ---------------------------------------------------------------------------
+
+
+class TestAutoCreateSkillOAuthValidation:
+    """auto_create_skill validates OAuth params per channel and combination."""
+
+    @pytest.mark.asyncio
+    async def test_smart_home_without_oauth_raises_value_error(self) -> None:
+        """channel='smartHome' without OAuth params → ValueError before any network."""
+        with pytest.raises(ValueError, match=r"smartHome.*requires OAuth"):
+            await auto_create_skill(
+                authenticator=_fake_authenticator(),
+                skill_name="x",
+                artifacts=SkillCreationArtifacts(),
+                backend_uri=_TEST_BACKEND_URI,
+                channel=SMART_HOME_CHANNEL,
+                logo_bytes=b"\x89PNG",
+                creator_factory=lambda _s: _make_creator_mock(),
+            )
+
+    @pytest.mark.asyncio
+    async def test_partial_oauth_args_raises_value_error(self) -> None:
+        """Only some oauth_* set → ValueError (programmer error)."""
+        with pytest.raises(ValueError, match=r"OAuth params are partial"):
+            await auto_create_skill(
+                authenticator=_fake_authenticator(),
+                skill_name="x",
+                artifacts=SkillCreationArtifacts(),
+                backend_uri=_TEST_BACKEND_URI,
+                channel=DIALOG_CHANNEL,
+                description=_TEST_DIALOG_DESCRIPTION,
+                # only one of four OAuth params
+                oauth_authorize_url=_TEST_AUTH_AUTHORIZE_URL,
+                logo_bytes=b"\x89PNG",
+                creator_factory=lambda _s: _make_creator_mock(),
+            )
+
+    @pytest.mark.asyncio
+    async def test_dialog_with_full_oauth_attaches_oauth(self) -> None:
+        """channel='aliceSkill' + full OAuth tuple → OAuth steps run."""
+        creator = _make_creator_mock()
+        result = await auto_create_skill(
+            authenticator=_fake_authenticator(),
+            skill_name="Test Dialog Skill",
+            artifacts=SkillCreationArtifacts(),
+            backend_uri=_TEST_DIALOG_BACKEND_URI,
+            channel=DIALOG_CHANNEL,
+            description=_TEST_DIALOG_DESCRIPTION,
+            oauth_authorize_url=_TEST_AUTH_AUTHORIZE_URL,
+            oauth_token_url=_TEST_AUTH_TOKEN_URL,
+            oauth_client_id=_TEST_OAUTH_CLIENT_ID,
+            oauth_client_secret=_TEST_OAUTH_CLIENT_SECRET,
+            logo_bytes=b"\x89PNG",
+            creator_factory=lambda _s: creator,
+        )
+        assert result.state == SkillCreationState.DONE
+        assert result.oauth_app_id == "oauth-app-id-789"
+        creator.create_oauth_app.assert_awaited_once()
+        creator.attach_oauth.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_dialog_default_logo_loaded_on_none(self) -> None:
+        """logo_bytes=None for channel='aliceSkill' triggers load_default_logo_bytes."""
+        creator = _make_creator_mock()
+        await auto_create_skill(
+            authenticator=_fake_authenticator(),
+            skill_name="Test Dialog Skill",
+            artifacts=SkillCreationArtifacts(),
+            backend_uri=_TEST_DIALOG_BACKEND_URI,
+            channel=DIALOG_CHANNEL,
+            description=_TEST_DIALOG_DESCRIPTION,
+            logo_bytes=None,
+            creator_factory=lambda _s: creator,
+        )
+        upload_call = creator.upload_logo.await_args
+        assert upload_call is not None
+        png_arg = (
+            upload_call.args[2] if len(upload_call.args) >= 3 else upload_call.kwargs.get("png")
+        )
+        assert isinstance(png_arg, bytes)
+        # PNG magic header
+        assert png_arg[:8] == bytes.fromhex("89504e470d0a1a0a")

@@ -1,28 +1,23 @@
 """Low-level client for the undocumented dialogs.yandex.ru developer API.
 
-Implements the 8-step sequence captured from Chrome DevTools HAR for
-creating a Smart Home skill with account-linking:
+Implements the captured-from-HAR sequence for creating a Yandex Dialogs skill:
 
-    1. GET  /developer                       → extract CSRF (secretkey)
-    2. GET  /developer/app-store-api/snapshot → existing skills list (optional)
-    3. POST /developer/app-store-api/apps                      → skill_id
-    4. POST /developer/app-store-api/apps/{id}/draft/upload-logo → logo_id
-    5. PATCH /developer/app-store-api/apps/{id}/draft/update    → settings
-    6. POST /developer/app-store-api/oauth/apps                → oauth_app_id
-    7. POST /developer/app-store-api/apps/{id}/oauthApp        → bind oauth
-    8. POST /developer/app-store-api/apps/{id}/draft/request-deploy → publish
+    1. GET   /developer                                            → extract CSRF (secretkey)
+    2. GET   /developer/app-store-api/snapshot                      → existing skills list
+    3. POST  /developer/app-store-api/apps                          → skill_id
+    4. POST  /developer/app-store-api/apps/{id}/draft/upload-logo   → logo_id
+    5. PATCH /developer/app-store-api/apps/{id}/draft/update        → settings
+    6. POST  /developer/app-store-api/oauth/apps                    → oauth_app_id (Smart Home only)
+    7. POST  /developer/app-store-api/apps/{id}/oauthApp            → bind oauth (Smart Home only)
+    8. POST  /developer/app-store-api/apps/{id}/draft/request-deploy → publish
+    9. DELETE /developer/app-store-api/apps/{id}?channel=...         → delete
 
 This is an UNDOCUMENTED, PRIVATE API. It may break at any time. The
-caller is responsible for surfacing that risk to the user (see
-``provider.auto_skill_ui``).
+caller is responsible for surfacing that risk to the user.
 
 Authentication: passport session cookies (``Session_id`` / ``sessionid2``)
 must already be present in the supplied ``aiohttp.ClientSession``'s
-cookie jar. Obtain them via ``ya_passport_auth.PassportClient``:
-
-    creds = await client.login_device_code(...)
-    await client.refresh_passport_cookies(creds.x_token)
-    creator = DialogsSkillCreator(client._session)
+cookie jar. Obtain them via ``ya_passport_auth.PassportClient``.
 
 The CSRF token (returned by ``fetch_csrf``) must be passed as the
 ``x-csrf-token`` header on every mutating request.
@@ -42,14 +37,25 @@ from typing import Any, Literal
 
 import aiohttp
 
+from .errors import (
+    DialogsApiError,
+    DialogsAuthError,
+    DialogsCsrfError,
+    DialogsDuplicateSkillError,
+    DialogsSkillNotFoundError,
+    DialogsValidationError,
+    parse_error_body,
+)
 from .state import SkillCreationArtifacts, SkillCreationState
 
-# Yandex Dialogs Developer API channel strings (sent in payloads + query strings).
-# These are HTTP protocol values, not framework configuration — keep them in the lib.
-SMART_HOME_CHANNEL = "smartHome"
-DIALOG_CHANNEL = "aliceSkill"
+# ---------------------------------------------------------------------------
+# Channel — Yandex API wire values (sent in payloads + query strings)
+# ---------------------------------------------------------------------------
 
-SkillType = Literal["smart_home", "dialog"]
+Channel = Literal["smartHome", "aliceSkill"]
+
+SMART_HOME_CHANNEL: Channel = "smartHome"
+DIALOG_CHANNEL: Channel = "aliceSkill"
 
 # A caller-provided context manager factory yielding an authorized aiohttp session.
 # The session must already carry Yandex Passport cookies (built via Device Flow,
@@ -65,13 +71,16 @@ __all__ = [
     "DIALOG_CHANNEL",
     "SMART_HOME_CHANNEL",
     "AuthenticatorCM",
+    "Channel",
     "DialogsApiError",
+    "DialogsAuthError",
     "DialogsCsrfError",
     "DialogsDuplicateSkillError",
     "DialogsSkillCreator",
-    "SkillType",
+    "DialogsSkillNotFoundError",
+    "DialogsValidationError",
     "auto_create_skill",
-    "auto_rename_dialog_skill",
+    "auto_update_skill",
     "build_dialog_draft_payload",
     "build_oauth_app_payload",
     "build_smart_home_draft_payload",
@@ -89,43 +98,11 @@ DIALOGS_API_BASE = f"{DIALOGS_DEV_BASE}/developer/app-store-api"
 
 # The developer console embeds a CSRF token in its HTML as:
 #   ..."secretkey":"u9c94f1aca53bf156be4..."...
-# Captured from HAR 2026-04-24. If Yandex re-renders differently, this
-# regex will miss and ``fetch_csrf`` raises ``DialogsCsrfError`` so the
-# user falls back to manual setup.
+# Captured from HAR 2026-04-24 and re-verified 2026-05-06. If Yandex re-renders
+# differently, this regex will miss and ``fetch_csrf`` raises ``DialogsCsrfError``.
 DIALOGS_CSRF_REGEX = re.compile(r'"secretkey":"([^"]+)"')
 
 _MAX_HTML_RESPONSE_BYTES = 2 * 1024 * 1024  # 2 MiB
-
-# ---------------------------------------------------------------------------
-# Errors
-# ---------------------------------------------------------------------------
-
-
-class DialogsApiError(Exception):
-    """Base error for dialogs.yandex.ru API failures."""
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        step: str,
-        http_status: int | None = None,
-        yandex_error: str | None = None,
-    ) -> None:
-        """Initialise with the pipeline step that failed for clearer messages."""
-        super().__init__(message)
-        self.step = step
-        self.http_status = http_status
-        self.yandex_error = yandex_error
-
-
-class DialogsCsrfError(DialogsApiError):
-    """Raised when the CSRF token cannot be extracted from the developer page."""
-
-
-class DialogsDuplicateSkillError(DialogsApiError):
-    """Raised when create_app rejects because a skill with the same name exists."""
-
 
 # ---------------------------------------------------------------------------
 # Client
@@ -147,13 +124,13 @@ class DialogsSkillCreator:
         session: aiohttp.ClientSession,
         logger: logging.Logger | None = None,
         *,
-        channel: str = SMART_HOME_CHANNEL,
+        channel: Channel = SMART_HOME_CHANNEL,
     ) -> None:
         """Take a session that already carries Passport auth cookies.
 
         ``channel`` selects the Yandex Dialogs skill family — defaults to
-        ``smartHome`` for the existing Smart Home pipeline; pass
-        :data:`DIALOG_CHANNEL` for the experimental «Навык» pipeline.
+        :data:`SMART_HOME_CHANNEL` (``"smartHome"``); pass
+        :data:`DIALOG_CHANNEL` (``"aliceSkill"``) for custom Alice skills.
         """
         self._session = session
         self._logger = logger or _LOGGER
@@ -169,10 +146,21 @@ class DialogsSkillCreator:
         Caller uses the returned value as the ``x-csrf-token`` header on
         all mutating requests. Returns a fresh token on every call; the
         orchestrator caches it for the duration of a single attempt.
+
+        Disables redirect-following: an anonymous request hits a 30x to
+        ``passport.yandex.ru`` and following the redirect would dump
+        Passport's HTML at us, where the CSRF regex never matches. We
+        treat the redirect as an explicit auth signal.
         """
-        async with self._session.get(DIALOGS_DEV_HTML_URL) as resp:
+        async with self._session.get(DIALOGS_DEV_HTML_URL, allow_redirects=False) as resp:
+            if resp.status in (301, 302, 303, 307, 308):
+                raise DialogsAuthError(
+                    "redirected to Passport — passport session cookies missing or expired",
+                    step="fetch_csrf",
+                    http_status=resp.status,
+                )
             if resp.status == 401:
-                raise DialogsApiError(
+                raise DialogsAuthError(
                     "not authenticated — passport session cookies missing or expired",
                     step="fetch_csrf",
                     http_status=401,
@@ -184,8 +172,7 @@ class DialogsSkillCreator:
                     http_status=resp.status,
                 )
             # Enforce the size cap while reading so an oversized
-            # response can't buffer fully in memory (T5 pattern from
-            # ya-passport-auth).
+            # response can't buffer fully in memory.
             body = bytearray()
             async for chunk in resp.content.iter_chunked(8192):
                 body.extend(chunk)
@@ -237,7 +224,7 @@ class DialogsSkillCreator:
     # -----------------------------------------------------------------------
 
     async def create_app(self, csrf: str, name: str) -> str:
-        """Create a Smart Home skill with the given name.
+        """Create a skill on the configured channel with the given name.
 
         Returns the newly-minted ``skill_id`` (UUID). Raises
         :class:`DialogsDuplicateSkillError` if the name is already taken
@@ -279,34 +266,19 @@ class DialogsSkillCreator:
         """
         url = f"{DIALOGS_API_BASE}/apps/{skill_id}/draft/upload-logo?channel={self._channel}"
         form = aiohttp.FormData()
-        form.add_field(
-            "file",
-            png,
-            filename="icon.png",
-            content_type="image/png",
-        )
+        form.add_field("file", png, filename="icon.png", content_type="image/png")
         headers = {"x-csrf-token": csrf}
         async with self._session.post(url, data=form, headers=headers) as resp:
             body = await resp.text()
             if resp.status != 200:
-                raise DialogsApiError(
-                    f"upload_logo HTTP {resp.status}: {body[:200]}",
-                    step="upload_logo",
-                    http_status=resp.status,
-                )
-            data = _try_json(body)
+                raise parse_error_body(body, http_status=resp.status, step="upload_logo")
+            data = _try_json_or_raise(body, step="upload_logo", method="POST", url=url)
         result = data.get("result") if isinstance(data, dict) else None
         if not isinstance(result, dict):
-            raise DialogsApiError(
-                "upload_logo response missing 'result'",
-                step="upload_logo",
-            )
+            raise DialogsApiError("upload_logo response missing 'result'", step="upload_logo")
         logo_id = result.get("id")
         if not isinstance(logo_id, str) or not logo_id:
-            raise DialogsApiError(
-                "upload_logo response missing logo id",
-                step="upload_logo",
-            )
+            raise DialogsApiError("upload_logo response missing logo id", step="upload_logo")
         return logo_id
 
     # -----------------------------------------------------------------------
@@ -353,14 +325,12 @@ class DialogsSkillCreator:
         result = data.get("result")
         if not isinstance(result, dict):
             raise DialogsApiError(
-                "create_oauth_app response missing 'result'",
-                step="create_oauth_app",
+                "create_oauth_app response missing 'result'", step="create_oauth_app"
             )
         oauth_app_id = result.get("id")
         if not isinstance(oauth_app_id, str) or not oauth_app_id:
             raise DialogsApiError(
-                "create_oauth_app response missing oauth app id",
-                step="create_oauth_app",
+                "create_oauth_app response missing oauth app id", step="create_oauth_app"
             )
         return oauth_app_id
 
@@ -389,11 +359,28 @@ class DialogsSkillCreator:
         async with self._session.post(url, headers=headers) as resp:
             body = await resp.text()
             if resp.status not in (200, 201, 202, 204):
-                raise DialogsApiError(
-                    f"request_deploy HTTP {resp.status}: {body[:200]}",
-                    step="request_deploy",
-                    http_status=resp.status,
-                )
+                raise parse_error_body(body, http_status=resp.status, step="request_deploy")
+
+    # -----------------------------------------------------------------------
+    # Step 9: delete the skill (cleanup / CI use)
+    # -----------------------------------------------------------------------
+
+    async def delete_skill(self, csrf: str, skill_id: str) -> None:
+        """Delete a skill and its associated draft, logos, and operations.
+
+        The OAuth-app attached to the skill (if any) is **not** removed by
+        this call — orphaned OAuth apps remain in ``/oauth/apps``.
+
+        Verified empirically 2026-05-06: returns ``HTTP 200`` with body
+        ``{}`` on success. The skill (and its in-flight moderation, if
+        any) is removed immediately and disappears from ``/snapshot``.
+        """
+        url = f"{DIALOGS_API_BASE}/apps/{skill_id}?channel={self._channel}"
+        headers = {"x-csrf-token": csrf}
+        async with self._session.delete(url, headers=headers) as resp:
+            body = await resp.text()
+            if resp.status not in (200, 204):
+                raise parse_error_body(body, http_status=resp.status, step="delete_skill")
 
     # -----------------------------------------------------------------------
     # Internal helpers
@@ -404,17 +391,10 @@ class DialogsSkillCreator:
         async with self._session.get(url, headers=headers) as resp:
             body = await resp.text()
             if resp.status != 200:
-                raise DialogsApiError(
-                    f"GET {url} HTTP {resp.status}: {body[:200]}",
-                    step=step,
-                    http_status=resp.status,
-                )
-            data = _try_json(body)
+                raise parse_error_body(body, http_status=resp.status, step=step)
+            data = _try_json_or_raise(body, step=step, method="GET", url=url)
         if not isinstance(data, dict):
-            raise DialogsApiError(
-                f"GET {url} returned non-object JSON",
-                step=step,
-            )
+            raise DialogsApiError(f"GET {url} returned non-object JSON", step=step)
         return data
 
     async def _post_json(
@@ -436,10 +416,7 @@ class DialogsSkillCreator:
         csrf: str,
         step: str,
     ) -> dict[str, Any]:
-        headers = {
-            "x-csrf-token": csrf,
-            "content-type": "application/json",
-        }
+        headers = {"x-csrf-token": csrf, "content-type": "application/json"}
         async with self._session.request(method, url, json=payload, headers=headers) as resp:
             body = await resp.text()
             # Only ``create_app`` can fail with duplicate-name errors —
@@ -453,15 +430,13 @@ class DialogsSkillCreator:
                     f"{step}: skill with this name already exists",
                     step=step,
                     http_status=resp.status,
-                    yandex_error=_extract_error_code(body),
+                    yandex_error=_extract_first_error_string(body),
                 )
             if resp.status not in (200, 201, 202):
                 # Empty / very short body 4xx — log a small safe subset of
                 # response headers so the user can see what Yandex actually
                 # returned (helps diagnose e.g. wrong "channel" parameter
                 # where the API rejects the request before generating a body).
-                # Avoid dumping the full header map: it includes Set-Cookie
-                # and other potentially sensitive values.
                 if not body.strip():
                     safe_headers = {
                         k: resp.headers.get(k)
@@ -474,27 +449,22 @@ class DialogsSkillCreator:
                         )
                         if resp.headers.get(k) is not None
                     }
+                    # NOTE: do NOT log fields from `payload` directly — it can
+                    # contain OAuth client_secret. Channel is duplicated on the
+                    # client object, log it from there instead.
                     _LOGGER.warning(
                         "Yandex %s %s returned %s with empty body; response "
-                        "headers=%s, request payload channel=%r",
+                        "headers=%s, client channel=%r",
                         method,
                         url,
                         resp.status,
                         safe_headers,
-                        payload.get("channel"),
+                        self._channel,
                     )
-                raise DialogsApiError(
-                    f"{method} {url} HTTP {resp.status}: {body[:200] or '<empty>'}",
-                    step=step,
-                    http_status=resp.status,
-                    yandex_error=_extract_error_code(body),
-                )
-            data = _try_json(body)
+                raise parse_error_body(body, http_status=resp.status, step=step)
+            data = _try_json_or_raise(body, step=step, method=method, url=url)
         if not isinstance(data, dict):
-            raise DialogsApiError(
-                f"{method} {url} returned non-object JSON",
-                step=step,
-            )
+            raise DialogsApiError(f"{method} {url} returned non-object JSON", step=step)
         return data
 
 
@@ -503,14 +473,15 @@ class DialogsSkillCreator:
 # ---------------------------------------------------------------------------
 
 
-def _try_json(body: str) -> Any:
-    """Parse JSON defensively — return None on any error."""
+def _try_json_or_raise(body: str, *, step: str, method: str, url: str) -> Any:
+    """Parse JSON body, return ``None`` for empty body, raise on malformed."""
     if not body:
         return None
     try:
         return json.loads(body)
-    except (ValueError, TypeError):
-        return None
+    except (ValueError, TypeError) as exc:
+        msg = f"{method} {url} returned malformed JSON: {exc}"
+        raise DialogsApiError(msg, step=step) from exc
 
 
 def _looks_like_duplicate(body: str) -> bool:
@@ -523,9 +494,12 @@ def _looks_like_duplicate(body: str) -> bool:
     )
 
 
-def _extract_error_code(body: str) -> str | None:
-    """Pull Yandex error code/message out of a 4xx response body (best-effort)."""
-    data = _try_json(body)
+def _extract_first_error_string(body: str) -> str | None:
+    """Pull a top-level error string out of a JSON body (best-effort)."""
+    try:
+        data = json.loads(body)
+    except (ValueError, TypeError):
+        return None
     if not isinstance(data, dict):
         return None
     for key in ("error", "errorCode", "message", "code"):
@@ -536,10 +510,7 @@ def _extract_error_code(body: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Pure helpers: backend/oauth URLs, payload builders, preconditions
-#
-# All of these are side-effect-free and separately unit-testable; the
-# orchestrator in a later commit wires them together.
+# Pure helpers: payload builders
 # ---------------------------------------------------------------------------
 
 
@@ -574,7 +545,7 @@ def build_smart_home_draft_payload(
             "category": "smart_home",
             "developerName": developer_name,
             "secondaryTitle": "",
-            "email": "",  # server pulls from the authenticated session
+            "email": "",
             "smartHome": {
                 "deepLinks": {
                     "android": {"url": ""},
@@ -610,35 +581,14 @@ def build_dialog_draft_payload(
     voice: str = "good_oksana",
     developer_name: str = "Skill creator",
 ) -> dict[str, Any]:
-    """Compose the PATCH /draft/update body for a Yandex Dialogs custom skill.
+    """Compose the PATCH /draft/update body for a custom Alice (``aliceSkill``) skill.
 
     All fields and shapes were captured from a live PATCH issued by the
-    dev console after the user filled the form successfully. Notable
-    discoveries:
+    dev console after the user filled the form successfully.
 
-    - ``structuredExamples`` shape: each entry is
-      ``{"marker": <activator>, "activationPhrase": <skill_name>,
-      "request": <phrase>, "is_valid": true}`` — NOT ``{"phrase": "..."}``
-      as we previously guessed (that wrong shape was the cause of all
-      the silent HTTP 400 + empty-body rejections from Yandex).
-    - ``description``: required non-empty (caller provides domain-relevant text).
-    - ``category``: defaults to ``"music_audio"`` (API key for "Аудио и подкасты").
-    - ``email``: empty string is OK; Yandex pre-fills it from the user's
-      Passport account on its side anyway.
-
-    Args:
-        skill_name: Display name of the skill.
-        backend_uri: Full HTTPS webhook URL the skill should call.
-        logo_id: ID returned by ``upload_logo``, or None.
-        description: Required non-empty description shown in the skill catalog.
-        structured_examples: Optional override for the list of activator/phrase
-            examples shown to moderators. If None, uses a single example
-            ``"попроси {skill_name} <something>"`` placeholder.
-        activation_phrases: Optional override for the activation phrase list.
-            Defaults to ``[skill_name]``.
-        category: Yandex catalog category key. Default ``"music_audio"``.
-        voice: TTS voice identifier. Default ``"good_oksana"``.
-        developer_name: Display name for the developer attribution.
+    Yandex validates ``name``: it must contain at least two words, otherwise
+    PATCH returns 400 ``{"error":{"fields":{"name":"Название должно содержать
+    минимум два слова"}}}``.
     """
     if structured_examples is None:
         structured_examples = [
@@ -697,8 +647,8 @@ def build_oauth_app_payload(
 ) -> dict[str, Any]:
     """Compose the POST /oauth/apps body for account-linking.
 
-    The caller is responsible for computing ``client_id`` / ``client_secret``
-    / ``authorize_url`` / ``token_url`` for their integration. ``refreshTokenUrl``
+    The caller is responsible for computing ``client_id`` / ``client_secret`` /
+    ``authorize_url`` / ``token_url`` for their integration. ``refreshTokenUrl``
     always equals ``token_url`` — Yandex's flow uses the same endpoint
     for both grant types.
     """
@@ -722,53 +672,118 @@ def build_oauth_app_payload(
 DEVICE_FLOW_TIMEOUT_SECONDS = 300.0
 
 
+# A pipeline executor takes the fetched CSRF token and a checkpoint callback,
+# and advances the pipeline as far as it can. Used by ``_run_with_recovery``
+# so the recovery harness is independent of the specific channel/OAuth shape.
+_PipelineExecutor = Callable[
+    [str, Callable[[SkillCreationArtifacts], Awaitable[None]]],
+    Awaitable[SkillCreationArtifacts],
+]
+
+
+def _validate_oauth_args(
+    *,
+    channel: Channel,
+    oauth_authorize_url: str | None,
+    oauth_token_url: str | None,
+    oauth_client_id: str | None,
+    oauth_client_secret: str | None,
+) -> bool:
+    """Return ``True`` if OAuth pipeline should run; raise on inconsistent inputs.
+
+    Rules:
+
+    - All-four or none. Mixed is a programmer error → ``ValueError``.
+    - ``smartHome`` requires all four (Smart Home skills always need
+      account-linking) → ``ValueError`` if missing.
+    - ``aliceSkill`` accepts both with or without OAuth; the four-tuple
+      simply selects the pipeline shape.
+    """
+    parts = (oauth_authorize_url, oauth_token_url, oauth_client_id, oauth_client_secret)
+    has_all = all(p is not None for p in parts)
+    has_any = any(p is not None for p in parts)
+    if has_any and not has_all:
+        msg = (
+            "OAuth params are partial — pass all four "
+            "(oauth_authorize_url, oauth_token_url, oauth_client_id, oauth_client_secret) or none"
+        )
+        raise ValueError(msg)
+    if channel == SMART_HOME_CHANNEL and not has_all:
+        msg = (
+            "channel='smartHome' requires OAuth params "
+            "(oauth_authorize_url, oauth_token_url, oauth_client_id, oauth_client_secret)"
+        )
+        raise ValueError(msg)
+    return has_all
+
+
 async def auto_create_skill(
     *,
     authenticator: AuthenticatorCM,
     skill_name: str,
     artifacts: SkillCreationArtifacts,
     backend_uri: str,
-    oauth_authorize_url: str,
-    oauth_token_url: str,
-    oauth_client_id: str,
-    oauth_client_secret: str,
-    logo_bytes: bytes,
-    skill_type: SkillType = "smart_home",
-    dialog_description: str | None = None,
-    dialog_structured_examples: list[dict[str, Any]] | None = None,
-    dialog_activation_phrases: list[str] | None = None,
-    dialog_category: str = "music_audio",
-    dialog_voice: str = "good_oksana",
+    channel: Channel = SMART_HOME_CHANNEL,
+    oauth_authorize_url: str | None = None,
+    oauth_token_url: str | None = None,
+    oauth_client_id: str | None = None,
+    oauth_client_secret: str | None = None,
+    logo_bytes: bytes | None = None,
+    description: str | None = None,
+    structured_examples: list[dict[str, Any]] | None = None,
+    activation_phrases: list[str] | None = None,
+    category: str | None = None,
+    voice: str | None = None,
     progress_cb: Callable[[SkillCreationArtifacts], Awaitable[None]] | None = None,
     creator_factory: Callable[[aiohttp.ClientSession], DialogsSkillCreator] | None = None,
     developer_name: str = "Skill creator",
 ) -> SkillCreationArtifacts:
     """Run the full skill-creation pipeline against an authenticated session.
 
-    The caller is responsible for authentication: ``authenticator`` is a
-    no-arg async-context-manager factory that yields a ``aiohttp.ClientSession``
-    already carrying Yandex Passport cookies. Typically the caller wraps
-    :class:`ya_passport_auth.PassportClient` (Device Flow / QR / cookie login)
-    and any UX surface they want around it.
+    Channel selection (Yandex API wire values):
 
-    Resumes from ``artifacts.state`` — steps that already completed
-    (skill_id present, etc.) are skipped. On any pipeline error, returns
-    artifacts with ``state=FAILED`` and a human-readable ``last_error``
-    instead of re-raising, so a config-flow UI can render the message
-    without crashing.
+    - ``channel="smartHome"`` (default) — Smart Home skill. Requires all four
+      ``oauth_*`` params (account-linking is mandatory for Smart Home).
+    - ``channel="aliceSkill"`` — custom Alice dialog skill. ``description``
+      (non-empty after ``.strip()``) is required. OAuth is optional: provide
+      all four ``oauth_*`` to attach an OAuth app, or omit them all to skip
+      account-linking entirely. Verified empirically 2026-05-06 that Yandex
+      accepts ``request_deploy`` for ``aliceSkill`` skills with no OAuth.
 
-    ``progress_cb`` is invoked after each successful step with the
-    updated artifacts; persist them and on the next call pass the saved
-    artifacts back in so the pipeline resumes from the latest completed step.
+    Other parameters:
 
-    For ``skill_type="dialog"``, ``dialog_description`` is required (Yandex
-    rejects empty descriptions for custom Alice skills).
+    - ``logo_bytes`` defaults to :func:`load_default_logo_bytes` when ``None``.
+    - For ``aliceSkill``: ``category`` defaults to ``"music_audio"``, ``voice``
+      to ``"good_oksana"``, ``activation_phrases`` to ``[skill_name]``, and
+      ``structured_examples`` to a single placeholder.
+    - ``progress_cb`` is invoked after each successful step with the updated
+      artifacts; persist them and on the next call pass the saved artifacts
+      back in so the pipeline resumes from the latest completed step.
+
+    Authentication is the caller's responsibility: ``authenticator`` is a
+    no-arg async-context-manager factory that yields an
+    ``aiohttp.ClientSession`` already carrying Yandex Passport cookies.
+
+    Resumes from ``artifacts.state`` — steps that already completed are
+    skipped. On any pipeline error, returns artifacts with ``state=FAILED``
+    and a human-readable ``last_error`` instead of re-raising, so a config-flow
+    UI can render the message without crashing.
     """
-    if skill_type == "dialog" and not dialog_description:
-        msg = "dialog_description is required for skill_type='dialog'"
+    # Channel-specific input validation
+    has_oauth = _validate_oauth_args(
+        channel=channel,
+        oauth_authorize_url=oauth_authorize_url,
+        oauth_token_url=oauth_token_url,
+        oauth_client_id=oauth_client_id,
+        oauth_client_secret=oauth_client_secret,
+    )
+
+    if channel == DIALOG_CHANNEL and (description is None or not description.strip()):
+        msg = "description (non-empty) is required for channel='aliceSkill'"
         return dataclasses.replace(artifacts, state=SkillCreationState.FAILED, last_error=msg)
 
-    channel = DIALOG_CHANNEL if skill_type == "dialog" else SMART_HOME_CHANNEL
+    if logo_bytes is None:
+        logo_bytes = load_default_logo_bytes()
 
     try:
         async with authenticator() as session:
@@ -777,27 +792,40 @@ async def auto_create_skill(
                 if creator_factory is not None
                 else DialogsSkillCreator(session, channel=channel)
             )
-            return await _run_pipeline_with_recovery(
+
+            async def executor(
+                csrf: str,
+                track: Callable[[SkillCreationArtifacts], Awaitable[None]],
+            ) -> SkillCreationArtifacts:
+                return await _execute_pipeline(
+                    creator=creator,
+                    csrf=csrf,
+                    artifacts=artifacts,
+                    skill_name=skill_name,
+                    backend_uri=backend_uri,
+                    channel=channel,
+                    has_oauth=has_oauth,
+                    oauth_authorize_url=oauth_authorize_url,
+                    oauth_token_url=oauth_token_url,
+                    oauth_client_id=oauth_client_id,
+                    oauth_client_secret=oauth_client_secret,
+                    logo_bytes=logo_bytes,
+                    description=description,
+                    structured_examples=structured_examples,
+                    activation_phrases=activation_phrases,
+                    category=category,
+                    voice=voice,
+                    developer_name=developer_name,
+                    progress_cb=track,
+                )
+
+            return await _run_with_recovery(
                 creator=creator,
                 artifacts=artifacts,
-                skill_name=skill_name,
-                backend_uri=backend_uri,
-                oauth_authorize_url=oauth_authorize_url,
-                oauth_token_url=oauth_token_url,
-                oauth_client_id=oauth_client_id,
-                oauth_client_secret=oauth_client_secret,
-                logo_bytes=logo_bytes,
-                skill_type=skill_type,
-                dialog_description=dialog_description,
-                dialog_structured_examples=dialog_structured_examples,
-                dialog_activation_phrases=dialog_activation_phrases,
-                dialog_category=dialog_category,
-                dialog_voice=dialog_voice,
-                developer_name=developer_name,
+                executor=executor,
                 progress_cb=progress_cb,
             )
     except asyncio.CancelledError:
-        # Preserve cooperative cancellation — do not absorb into FAILED.
         raise
     except ValueError:
         raise
@@ -806,32 +834,19 @@ async def auto_create_skill(
         return dataclasses.replace(artifacts, state=SkillCreationState.FAILED, last_error=repr(exc))
 
 
-async def _run_pipeline_with_recovery(
+async def _run_with_recovery(
     *,
     creator: DialogsSkillCreator,
     artifacts: SkillCreationArtifacts,
-    skill_name: str,
-    backend_uri: str,
-    oauth_authorize_url: str,
-    oauth_token_url: str,
-    oauth_client_id: str,
-    oauth_client_secret: str,
-    logo_bytes: bytes,
-    skill_type: SkillType,
-    dialog_description: str | None,
-    dialog_structured_examples: list[dict[str, Any]] | None,
-    dialog_activation_phrases: list[str] | None,
-    dialog_category: str,
-    dialog_voice: str,
-    developer_name: str,
+    executor: _PipelineExecutor,
     progress_cb: Callable[[SkillCreationArtifacts], Awaitable[None]] | None,
 ) -> SkillCreationArtifacts:
-    """Fetch CSRF and run the pipeline, preserving partial state on failure.
+    """Fetch CSRF and run the executor, preserving partial state on failure.
 
-    Holds a ``current`` reference that ``_execute_pipeline`` updates via
-    ``progress_cb``, so a mid-pipeline raise lets us surface whatever
-    progress was captured (skill_id / logo_id / oauth_app_id) as a
-    FAILED artifact instead of losing it.
+    Holds a ``current`` reference that the executor updates via the tracker
+    callback, so a mid-pipeline raise lets us surface whatever progress was
+    captured (skill_id / logo_id / oauth_app_id) as a FAILED artifact
+    instead of losing it.
     """
     current = artifacts
 
@@ -845,26 +860,7 @@ async def _run_pipeline_with_recovery(
         _LOGGER.info("auto-skill: fetching CSRF from dialogs.yandex.ru")
         csrf = await creator.fetch_csrf()
         _LOGGER.info("auto-skill: CSRF acquired, starting skill pipeline")
-        return await _execute_pipeline(
-            creator=creator,
-            csrf=csrf,
-            artifacts=artifacts,
-            skill_name=skill_name,
-            backend_uri=backend_uri,
-            oauth_authorize_url=oauth_authorize_url,
-            oauth_token_url=oauth_token_url,
-            oauth_client_id=oauth_client_id,
-            oauth_client_secret=oauth_client_secret,
-            logo_bytes=logo_bytes,
-            skill_type=skill_type,
-            dialog_description=dialog_description,
-            dialog_structured_examples=dialog_structured_examples,
-            dialog_activation_phrases=dialog_activation_phrases,
-            dialog_category=dialog_category,
-            dialog_voice=dialog_voice,
-            developer_name=developer_name,
-            progress_cb=_track,
-        )
+        return await executor(csrf, _track)
     except DialogsApiError as exc:
         _LOGGER.warning("auto-create failed at %s: %s", exc.step, exc, exc_info=True)
         return dataclasses.replace(current, state=SkillCreationState.FAILED, last_error=str(exc))
@@ -877,171 +873,361 @@ async def _execute_pipeline(
     artifacts: SkillCreationArtifacts,
     skill_name: str,
     backend_uri: str,
+    channel: Channel,
+    has_oauth: bool,
+    oauth_authorize_url: str | None,
+    oauth_token_url: str | None,
+    oauth_client_id: str | None,
+    oauth_client_secret: str | None,
+    logo_bytes: bytes,
+    description: str | None,
+    structured_examples: list[dict[str, Any]] | None,
+    activation_phrases: list[str] | None,
+    category: str | None,
+    voice: str | None,
+    developer_name: str,
+    progress_cb: Callable[[SkillCreationArtifacts], Awaitable[None]] | None,
+) -> SkillCreationArtifacts:
+    """Compose the channel-appropriate sequence of pipeline steps.
+
+    OAuth steps run only when ``has_oauth=True``. The deploy-checkpoint step
+    accepts both ``DRAFT_UPDATED`` (no-OAuth path) and ``OAUTH_ATTACHED``
+    (with-OAuth path), so the same harness drives both flows.
+    """
+    artifacts = await _step_create_app(
+        creator=creator,
+        csrf=csrf,
+        artifacts=artifacts,
+        skill_name=skill_name,
+        progress_cb=progress_cb,
+    )
+    artifacts = await _step_upload_logo_and_update_draft(
+        creator=creator,
+        csrf=csrf,
+        artifacts=artifacts,
+        skill_name=skill_name,
+        backend_uri=backend_uri,
+        logo_bytes=logo_bytes,
+        channel=channel,
+        description=description,
+        structured_examples=structured_examples,
+        activation_phrases=activation_phrases,
+        category=category,
+        voice=voice,
+        developer_name=developer_name,
+        progress_cb=progress_cb,
+    )
+    if has_oauth:
+        # Type-narrow for mypy: _validate_oauth_args proved all four are non-None.
+        # Use explicit raise rather than assert so behaviour is preserved under -O.
+        if (
+            oauth_authorize_url is None
+            or oauth_token_url is None
+            or oauth_client_id is None
+            or oauth_client_secret is None
+        ):
+            msg = "internal error: has_oauth=True but oauth_* params are None"
+            raise RuntimeError(msg)
+        artifacts = await _step_create_oauth_app(
+            creator=creator,
+            csrf=csrf,
+            artifacts=artifacts,
+            skill_name=skill_name,
+            oauth_authorize_url=oauth_authorize_url,
+            oauth_token_url=oauth_token_url,
+            oauth_client_id=oauth_client_id,
+            oauth_client_secret=oauth_client_secret,
+            progress_cb=progress_cb,
+        )
+        artifacts = await _step_attach_oauth(
+            creator=creator,
+            csrf=csrf,
+            artifacts=artifacts,
+            progress_cb=progress_cb,
+        )
+    artifacts = await _step_checkpoint_deploy_requested(
+        artifacts=artifacts,
+        progress_cb=progress_cb,
+    )
+    artifacts = await _step_request_deploy(
+        creator=creator,
+        csrf=csrf,
+        artifacts=artifacts,
+        progress_cb=progress_cb,
+    )
+    return artifacts
+
+
+# ---------------------------------------------------------------------------
+# Pipeline step helpers — each is a single-state-transition Yandex API call.
+# Each helper is idempotent w.r.t. its input state: if the state is past its
+# transition, it returns artifacts unchanged.
+# ---------------------------------------------------------------------------
+
+
+async def _step_create_app(
+    *,
+    creator: DialogsSkillCreator,
+    csrf: str,
+    artifacts: SkillCreationArtifacts,
+    skill_name: str,
+    progress_cb: Callable[[SkillCreationArtifacts], Awaitable[None]] | None,
+) -> SkillCreationArtifacts:
+    """NONE/FAILED → APP_CREATED via ``creator.create_app``.
+
+    On retry from ``state=FAILED`` an existing ``skill_id`` means a previous
+    run already created the skill but failed at a later step — promote to
+    ``APP_CREATED`` instead of creating a duplicate skill.
+    """
+    if artifacts.state not in (SkillCreationState.NONE, SkillCreationState.FAILED):
+        return artifacts
+    if artifacts.skill_id is not None:
+        # Resume: skill already created in an earlier attempt.
+        artifacts = dataclasses.replace(
+            artifacts,
+            state=SkillCreationState.APP_CREATED,
+            last_error=None,
+        )
+        await _maybe_save(progress_cb, artifacts)
+        return artifacts
+    _LOGGER.info("auto-skill: creating skill app")
+    new_skill_id = await creator.create_app(csrf, skill_name)
+    artifacts = dataclasses.replace(
+        artifacts,
+        state=SkillCreationState.APP_CREATED,
+        skill_id=new_skill_id,
+        last_error=None,
+    )
+    await _maybe_save(progress_cb, artifacts)
+    return artifacts
+
+
+async def _step_upload_logo_and_update_draft(
+    *,
+    creator: DialogsSkillCreator,
+    csrf: str,
+    artifacts: SkillCreationArtifacts,
+    skill_name: str,
+    backend_uri: str,
+    logo_bytes: bytes,
+    channel: Channel,
+    description: str | None,
+    structured_examples: list[dict[str, Any]] | None,
+    activation_phrases: list[str] | None,
+    category: str | None,
+    voice: str | None,
+    developer_name: str,
+    progress_cb: Callable[[SkillCreationArtifacts], Awaitable[None]] | None,
+) -> SkillCreationArtifacts:
+    """APP_CREATED → DRAFT_UPDATED via ``upload_logo`` + ``update_draft``."""
+    if artifacts.state != SkillCreationState.APP_CREATED:
+        return artifacts
+    if artifacts.skill_id is None:
+        msg = "internal error: skill_id missing at logo+draft step"
+        raise RuntimeError(msg)
+    skill_id: str = artifacts.skill_id
+
+    logo_id = artifacts.logo_id
+    if logo_id is None:
+        _LOGGER.info("auto-skill: uploading logo")
+        logo_id = await creator.upload_logo(csrf, skill_id, logo_bytes)
+        artifacts = dataclasses.replace(artifacts, logo_id=logo_id)
+
+    if channel == DIALOG_CHANNEL:
+        if description is None:
+            msg = "description is required for channel='aliceSkill'"
+            raise ValueError(msg)
+        draft = build_dialog_draft_payload(
+            skill_name=skill_name,
+            backend_uri=backend_uri,
+            logo_id=logo_id,
+            description=description,
+            structured_examples=structured_examples,
+            activation_phrases=activation_phrases,
+            category=category if category is not None else "music_audio",
+            voice=voice if voice is not None else "good_oksana",
+            developer_name=developer_name,
+        )
+    else:
+        draft = build_smart_home_draft_payload(
+            skill_name=skill_name,
+            backend_uri=backend_uri,
+            logo_id=logo_id,
+            developer_name=developer_name,
+        )
+    _LOGGER.info("auto-skill: updating draft with settings")
+    await creator.update_draft(csrf, skill_id, draft)
+    artifacts = dataclasses.replace(
+        artifacts,
+        state=SkillCreationState.DRAFT_UPDATED,
+        last_known_name=skill_name,
+    )
+    await _maybe_save(progress_cb, artifacts)
+    return artifacts
+
+
+async def _step_create_oauth_app(
+    *,
+    creator: DialogsSkillCreator,
+    csrf: str,
+    artifacts: SkillCreationArtifacts,
+    skill_name: str,
     oauth_authorize_url: str,
     oauth_token_url: str,
     oauth_client_id: str,
     oauth_client_secret: str,
-    logo_bytes: bytes,
-    skill_type: SkillType,
-    dialog_description: str | None,
-    dialog_structured_examples: list[dict[str, Any]] | None,
-    dialog_activation_phrases: list[str] | None,
-    dialog_category: str,
-    dialog_voice: str,
-    developer_name: str,
     progress_cb: Callable[[SkillCreationArtifacts], Awaitable[None]] | None,
 ) -> SkillCreationArtifacts:
-    """Advance through states sequentially, skipping completed steps."""
-    state = artifacts.state
-
-    # -- Step 3: create app --
-    if state in (SkillCreationState.NONE, SkillCreationState.FAILED):
-        _LOGGER.info("auto-skill: [1/5] creating skill app")
-        new_skill_id = await creator.create_app(csrf, skill_name)
-        artifacts = dataclasses.replace(
-            artifacts,
-            state=SkillCreationState.APP_CREATED,
-            skill_id=new_skill_id,
-            last_error=None,
-        )
-        await _maybe_save(progress_cb, artifacts)
-        state = artifacts.state
-
-    if artifacts.skill_id is None:
-        msg = "internal error: skill_id missing after create_app"
-        raise RuntimeError(msg)
-    skill_id: str = artifacts.skill_id
-
-    # -- Step 4+5: upload logo and update draft (merged step) --
-    if state == SkillCreationState.APP_CREATED:
-        logo_id = artifacts.logo_id
-        if logo_id is None:
-            _LOGGER.info("auto-skill: [2/5] uploading logo")
-            logo_id = await creator.upload_logo(csrf, skill_id, logo_bytes)
-            artifacts = dataclasses.replace(artifacts, logo_id=logo_id)
-
-        if skill_type == "dialog":
-            if dialog_description is None:
-                msg = "dialog_description is required for skill_type='dialog'"
-                raise ValueError(msg)
-            draft = build_dialog_draft_payload(
-                skill_name=skill_name,
-                backend_uri=backend_uri,
-                logo_id=logo_id,
-                description=dialog_description,
-                structured_examples=dialog_structured_examples,
-                activation_phrases=dialog_activation_phrases,
-                category=dialog_category,
-                voice=dialog_voice,
-                developer_name=developer_name,
-            )
-        else:
-            draft = build_smart_home_draft_payload(
-                skill_name=skill_name,
-                backend_uri=backend_uri,
-                logo_id=logo_id,
-                developer_name=developer_name,
-            )
-        _LOGGER.info("auto-skill: [3/5] updating draft with settings")
-        await creator.update_draft(csrf, skill_id, draft)
-        artifacts = dataclasses.replace(
-            artifacts,
-            state=SkillCreationState.DRAFT_UPDATED,
-            last_known_name=skill_name,
-        )
-        await _maybe_save(progress_cb, artifacts)
-        state = artifacts.state
-
-    # -- Step 6: create OAuth app --
-    if state == SkillCreationState.DRAFT_UPDATED:
-        _LOGGER.info("auto-skill: [4/5] creating OAuth app + attaching")
-        oauth_app_id = await creator.create_oauth_app(
-            csrf,
-            name=skill_name,
-            client_id=oauth_client_id,
-            client_secret=oauth_client_secret,
-            authorize_url=oauth_authorize_url,
-            token_url=oauth_token_url,
-            refresh_url=oauth_token_url,
-        )
-        artifacts = dataclasses.replace(
-            artifacts,
-            state=SkillCreationState.OAUTH_CREATED,
-            oauth_app_id=oauth_app_id,
-        )
-        await _maybe_save(progress_cb, artifacts)
-        state = artifacts.state
-
-    if artifacts.oauth_app_id is None:
-        msg = "internal error: oauth_app_id missing after create_oauth_app"
-        raise RuntimeError(msg)
-    oauth_app_id_str: str = artifacts.oauth_app_id
-
-    # -- Step 7: attach OAuth app to skill --
-    if state == SkillCreationState.OAUTH_CREATED:
-        await creator.attach_oauth(csrf, skill_id, oauth_app_id_str)
-        artifacts = dataclasses.replace(artifacts, state=SkillCreationState.OAUTH_ATTACHED)
-        await _maybe_save(progress_cb, artifacts)
-        state = artifacts.state
-
-    # -- Step 8: publish --
-    # Checkpoint state=DEPLOY_REQUESTED *before* calling request_deploy
-    # so a crash after the call reached Yandex but before we returned
-    # can skip straight to DONE on retry (Yandex accepts the idempotent
-    # re-deploy but we'd rather not re-drive the flow end-to-end).
-    if state == SkillCreationState.OAUTH_ATTACHED:
-        artifacts = dataclasses.replace(artifacts, state=SkillCreationState.DEPLOY_REQUESTED)
-        await _maybe_save(progress_cb, artifacts)
-        state = artifacts.state
-
-    if state == SkillCreationState.DEPLOY_REQUESTED:
-        _LOGGER.info("auto-skill: [5/5] publishing skill")
-        await creator.request_deploy(csrf, skill_id)
-        # Yandex's deploy is async — for smart_home it usually completes
-        # in a few seconds, but for aliceSkill ("Навык") it can take
-        # 5-15 minutes under typical moderation queue conditions. The
-        # request was accepted, Yandex will finish on its side. Callers
-        # surface a direct link to the skill's dev-console page so the
-        # user can check the on-air indicator at their convenience.
-        _LOGGER.info(
-            "auto-skill: deploy requested for skill %s — Yandex processes "
-            "this asynchronously (a few seconds for smart_home, several "
-            "minutes for dialog skills). Watch on-air status at "
-            "https://dialogs.yandex.ru/developer/skills/%s",
-            skill_id,
-            skill_id,
-        )
-        artifacts = dataclasses.replace(artifacts, state=SkillCreationState.DONE)
-        await _maybe_save(progress_cb, artifacts)
-
+    """DRAFT_UPDATED → OAUTH_CREATED via ``creator.create_oauth_app``."""
+    if artifacts.state != SkillCreationState.DRAFT_UPDATED:
+        return artifacts
+    _LOGGER.info("auto-skill: creating OAuth app")
+    oauth_app_id = await creator.create_oauth_app(
+        csrf,
+        name=skill_name,
+        client_id=oauth_client_id,
+        client_secret=oauth_client_secret,
+        authorize_url=oauth_authorize_url,
+        token_url=oauth_token_url,
+        refresh_url=oauth_token_url,
+    )
+    artifacts = dataclasses.replace(
+        artifacts,
+        state=SkillCreationState.OAUTH_CREATED,
+        oauth_app_id=oauth_app_id,
+    )
+    await _maybe_save(progress_cb, artifacts)
     return artifacts
 
 
-async def auto_rename_dialog_skill(
+async def _step_attach_oauth(
+    *,
+    creator: DialogsSkillCreator,
+    csrf: str,
+    artifacts: SkillCreationArtifacts,
+    progress_cb: Callable[[SkillCreationArtifacts], Awaitable[None]] | None,
+) -> SkillCreationArtifacts:
+    """OAUTH_CREATED → OAUTH_ATTACHED via ``creator.attach_oauth``."""
+    if artifacts.state != SkillCreationState.OAUTH_CREATED:
+        return artifacts
+    if artifacts.skill_id is None or artifacts.oauth_app_id is None:
+        msg = "internal error: skill_id/oauth_app_id missing at attach_oauth"
+        raise RuntimeError(msg)
+    await creator.attach_oauth(csrf, artifacts.skill_id, artifacts.oauth_app_id)
+    artifacts = dataclasses.replace(artifacts, state=SkillCreationState.OAUTH_ATTACHED)
+    await _maybe_save(progress_cb, artifacts)
+    return artifacts
+
+
+async def _step_checkpoint_deploy_requested(
+    *,
+    artifacts: SkillCreationArtifacts,
+    progress_cb: Callable[[SkillCreationArtifacts], Awaitable[None]] | None,
+) -> SkillCreationArtifacts:
+    """{OAUTH_ATTACHED, DRAFT_UPDATED} → DEPLOY_REQUESTED checkpoint.
+
+    Persists ``DEPLOY_REQUESTED`` *before* the network call so a crash after
+    Yandex accepted the deploy but before we returned can skip straight to
+    DONE on retry (the underlying API is idempotent for re-deploys but we'd
+    rather not redrive the whole flow).
+
+    Smart-home arrives here from ``OAUTH_ATTACHED``; OAuth-free dialog
+    pipelines from ``DRAFT_UPDATED``.
+    """
+    if artifacts.state in (
+        SkillCreationState.OAUTH_ATTACHED,
+        SkillCreationState.DRAFT_UPDATED,
+    ):
+        artifacts = dataclasses.replace(artifacts, state=SkillCreationState.DEPLOY_REQUESTED)
+        await _maybe_save(progress_cb, artifacts)
+    return artifacts
+
+
+async def _step_request_deploy(
+    *,
+    creator: DialogsSkillCreator,
+    csrf: str,
+    artifacts: SkillCreationArtifacts,
+    progress_cb: Callable[[SkillCreationArtifacts], Awaitable[None]] | None,
+) -> SkillCreationArtifacts:
+    """DEPLOY_REQUESTED → DONE via ``creator.request_deploy``.
+
+    Yandex's deploy is async — for ``smartHome`` it usually completes in a
+    few seconds, but for ``aliceSkill`` it can take 5–15 minutes under typical
+    moderation queue conditions. The request was accepted, Yandex will finish
+    on its side. Callers surface a direct link to the skill's dev-console
+    page so the user can check the on-air indicator at their convenience.
+    """
+    if artifacts.state != SkillCreationState.DEPLOY_REQUESTED:
+        return artifacts
+    if artifacts.skill_id is None:
+        msg = "internal error: skill_id missing at request_deploy"
+        raise RuntimeError(msg)
+    skill_id: str = artifacts.skill_id
+    _LOGGER.info("auto-skill: publishing skill")
+    await creator.request_deploy(csrf, skill_id)
+    _LOGGER.info(
+        "auto-skill: deploy requested for skill %s — Yandex processes "
+        "this asynchronously (a few seconds for smartHome, several "
+        "minutes for aliceSkill). Watch on-air status at "
+        "https://dialogs.yandex.ru/developer/skills/%s",
+        skill_id,
+        skill_id,
+    )
+    artifacts = dataclasses.replace(artifacts, state=SkillCreationState.DONE)
+    await _maybe_save(progress_cb, artifacts)
+    return artifacts
+
+
+async def auto_update_skill(
     *,
     authenticator: AuthenticatorCM,
     artifacts: SkillCreationArtifacts,
-    new_name: str,
+    skill_name: str,
     backend_uri: str,
-    description: str,
+    channel: Channel = SMART_HOME_CHANNEL,
+    description: str | None = None,
     structured_examples: list[dict[str, Any]] | None = None,
     activation_phrases: list[str] | None = None,
-    category: str = "music_audio",
-    voice: str = "good_oksana",
+    category: str | None = None,
+    voice: str | None = None,
+    progress_cb: Callable[[SkillCreationArtifacts], Awaitable[None]] | None = None,
     creator_factory: Callable[[aiohttp.ClientSession], DialogsSkillCreator] | None = None,
     developer_name: str = "Skill creator",
 ) -> SkillCreationArtifacts:
-    """Rename a dialog skill and re-deploy it.
+    """Update a skill draft and re-deploy it.
 
-    Patches the draft ``name`` field and calls ``request_deploy``. Does
-    not raise on failure — returns artifacts with ``state=FAILED`` and
-    ``last_error`` so the UI can display the message.
+    Works for both ``channel="smartHome"`` and ``channel="aliceSkill"``.
+    Patches the full draft payload and calls ``request_deploy``. Does not
+    raise on failure — returns artifacts with ``state=FAILED`` and
+    ``last_error`` set so the UI can display the message.
 
-    On success the returned artifacts have ``last_known_name=new_name``
-    and ``state=DONE`` so the drift-detector in the UI clears the banner.
+    On success the returned artifacts have ``last_known_name=skill_name``
+    and ``state=DONE``.
+
+    Args:
+        authenticator: No-arg async context-manager factory yielding an
+            authenticated ``aiohttp.ClientSession``.
+        artifacts: Current state machine snapshot (must have ``skill_id`` set).
+        skill_name: New display name for the skill.
+        backend_uri: Webhook backend URL.
+        channel: ``"smartHome"`` or ``"aliceSkill"``. Selects the draft
+            payload builder and the deploy channel query parameter.
+        description: Required for ``channel="aliceSkill"``, ignored for
+            ``channel="smartHome"``.
+        structured_examples: Alice dialog examples (``aliceSkill`` only).
+        activation_phrases: Activation phrases (``aliceSkill`` only).
+        category: Skill category (``aliceSkill`` only).
+        voice: TTS voice (``aliceSkill`` only).
+        progress_cb: Awaitable called after each state transition.
+        creator_factory: Override for the low-level client (used in tests).
+        developer_name: Developer display name embedded in the draft.
     """
     if artifacts.skill_id is None:
-        msg = "skill_id is missing — cannot rename a skill that has not been created"
+        msg = "skill_id is missing — cannot update a skill that has not been created"
+        return dataclasses.replace(artifacts, state=SkillCreationState.FAILED, last_error=msg)
+    if channel == DIALOG_CHANNEL and not (description or "").strip():
+        msg = "description (non-empty) is required for channel='aliceSkill'"
         return dataclasses.replace(artifacts, state=SkillCreationState.FAILED, last_error=msg)
 
     skill_id = artifacts.skill_id
@@ -1051,37 +1237,53 @@ async def auto_rename_dialog_skill(
             creator = (
                 creator_factory(session)
                 if creator_factory is not None
-                else DialogsSkillCreator(session, channel=DIALOG_CHANNEL)
+                else DialogsSkillCreator(session, channel=channel)
             )
             csrf = await creator.fetch_csrf()
 
-            draft = build_dialog_draft_payload(
-                skill_name=new_name,
-                backend_uri=backend_uri,
-                logo_id=artifacts.logo_id,
-                description=description,
-                structured_examples=structured_examples,
-                activation_phrases=activation_phrases,
-                category=category,
-                voice=voice,
-                developer_name=developer_name,
-            )
+            if channel == SMART_HOME_CHANNEL:
+                draft: dict[str, Any] = build_smart_home_draft_payload(
+                    skill_name=skill_name,
+                    backend_uri=backend_uri,
+                    logo_id=artifacts.logo_id,
+                    developer_name=developer_name,
+                )
+            else:
+                draft = build_dialog_draft_payload(
+                    skill_name=skill_name,
+                    backend_uri=backend_uri,
+                    logo_id=artifacts.logo_id,
+                    description=description or "",
+                    structured_examples=structured_examples,
+                    activation_phrases=activation_phrases,
+                    category=category or "music_audio",
+                    voice=voice or "good_oksana",
+                    developer_name=developer_name,
+                )
+
             await creator.update_draft(csrf, skill_id, draft)
             await creator.request_deploy(csrf, skill_id)
-            _LOGGER.info("auto-skill: dialog skill renamed to %r and re-deployed", new_name)
-            return dataclasses.replace(
+            _LOGGER.info(
+                "auto-skill: skill %r updated to name=%r and re-deployed (channel=%s)",
+                skill_id,
+                skill_name,
+                channel,
+            )
+            updated = dataclasses.replace(
                 artifacts,
                 state=SkillCreationState.DONE,
-                last_known_name=new_name,
+                last_known_name=skill_name,
                 last_error=None,
             )
+            await _maybe_save(progress_cb, updated)
+            return updated
     except asyncio.CancelledError:
         raise
     except DialogsApiError as exc:
-        _LOGGER.warning("rename-dialog-skill failed: %s", exc, exc_info=True)
+        _LOGGER.warning("auto-update-skill failed: %s", exc, exc_info=True)
         return dataclasses.replace(artifacts, state=SkillCreationState.FAILED, last_error=str(exc))
     except Exception as exc:
-        _LOGGER.exception("rename-dialog-skill hit unexpected error")
+        _LOGGER.exception("auto-update-skill hit unexpected error")
         return dataclasses.replace(artifacts, state=SkillCreationState.FAILED, last_error=repr(exc))
 
 
@@ -1096,8 +1298,9 @@ _FALLBACK_LOGO_PNG = bytes.fromhex(
 def load_default_logo_bytes() -> bytes:
     """Return PNG bytes for the bundled default skill logo.
 
-    Reads ``ya_dialogs_api/assets/default_logo.png`` (packaged via importlib.resources).
-    Falls back to a 1x1 transparent PNG so tests can run without the asset.
+    Reads ``ya_dialogs_api/assets/default_logo.png`` (packaged via
+    ``importlib.resources``). Falls back to a 1x1 transparent PNG so tests
+    can run without the asset.
     """
     try:
         ref = importlib.resources.files("ya_dialogs_api.assets").joinpath("default_logo.png")
