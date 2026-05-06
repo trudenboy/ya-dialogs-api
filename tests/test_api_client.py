@@ -687,6 +687,27 @@ class TestAutoCreateSkillResume:
         creator.request_deploy.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_resume_from_failed_with_skill_id_does_not_recreate(self) -> None:
+        """Retry after FAILED with existing skill_id must not call create_app again.
+
+        Otherwise callers persisting artifacts and retrying would create
+        duplicate skills on every transient failure.
+        """
+        creator = _make_creator_mock()
+        artifacts = SkillCreationArtifacts(
+            state=SkillCreationState.FAILED,
+            skill_id="already-created",
+            last_error="prev attempt died at logo upload",
+        )
+        result = await _run_orch(creator=creator, artifacts=artifacts)
+        assert result.state == SkillCreationState.DONE
+        assert result.skill_id == "already-created"  # ID preserved, not overwritten
+        creator.create_app.assert_not_awaited()
+        creator.upload_logo.assert_awaited_once()
+        creator.update_draft.assert_awaited_once()
+        creator.request_deploy.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_resume_from_oauth_attached_only_publishes(self) -> None:
         """Resuming from OAUTH_ATTACHED only runs request_deploy."""
         creator = _make_creator_mock()
@@ -1303,6 +1324,30 @@ class TestParseErrorBody:
         err = parse_error_body("not json at all", http_status=500, step="x")
         assert type(err) is DialogsApiError
         assert err.http_status == 500
+
+    def test_empty_body_401_returns_auth_error(self) -> None:
+        """HTTP 401 with empty body → DialogsAuthError (per HTTP semantics)."""
+
+        err = parse_error_body("", http_status=401, step="update_draft")
+        assert isinstance(err, DialogsAuthError)
+        assert err.http_status == 401
+
+    def test_json_body_401_returns_auth_error(self) -> None:
+        """HTTP 401 with JSON body → DialogsAuthError, not generic."""
+
+        err = parse_error_body('{"error":"unauthorized"}', http_status=401, step="x")
+        assert isinstance(err, DialogsAuthError)
+        assert err.http_status == 401
+
+    def test_non_html_403_falls_through(self) -> None:
+        """HTTP 403 with non-HTML JSON body parses through to body-shape rules.
+
+        Yandex uses 403 for both auth-walls (HTML) and domain-level "forbidden"
+        (JSON), so non-HTML 403 must not be auto-classified as auth.
+        """
+        body = '{"error":{"message":"Access denied","code":403}}'
+        err = parse_error_body(body, http_status=403, step="x")
+        assert not isinstance(err, DialogsAuthError)
 
 
 # ---------------------------------------------------------------------------

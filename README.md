@@ -75,7 +75,7 @@ async def my_authenticator() -> AsyncIterator[aiohttp.ClientSession]:
         yield session
 
 async def main() -> None:
-    artifacts = SkillCreationArtifacts(state=SkillCreationState.PENDING)
+    artifacts = SkillCreationArtifacts(state=SkillCreationState.NONE)
     result = await auto_create_skill(
         authenticator=my_authenticator,
         channel=SMART_HOME_CHANNEL,       # "smartHome"

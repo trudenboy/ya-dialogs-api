@@ -970,8 +970,22 @@ async def _step_create_app(
     skill_name: str,
     progress_cb: Callable[[SkillCreationArtifacts], Awaitable[None]] | None,
 ) -> SkillCreationArtifacts:
-    """NONE/FAILED → APP_CREATED via ``creator.create_app``."""
+    """NONE/FAILED → APP_CREATED via ``creator.create_app``.
+
+    On retry from ``state=FAILED`` an existing ``skill_id`` means a previous
+    run already created the skill but failed at a later step — promote to
+    ``APP_CREATED`` instead of creating a duplicate skill.
+    """
     if artifacts.state not in (SkillCreationState.NONE, SkillCreationState.FAILED):
+        return artifacts
+    if artifacts.skill_id is not None:
+        # Resume: skill already created in an earlier attempt.
+        artifacts = dataclasses.replace(
+            artifacts,
+            state=SkillCreationState.APP_CREATED,
+            last_error=None,
+        )
+        await _maybe_save(progress_cb, artifacts)
         return artifacts
     _LOGGER.info("auto-skill: creating skill app")
     new_skill_id = await creator.create_app(csrf, skill_name)

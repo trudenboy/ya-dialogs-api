@@ -185,19 +185,31 @@ def parse_error_body(
 
     Order of precedence:
 
-    1. **HTML 401/403** → :class:`DialogsAuthError` ("CSRF/cookies invalid").
-    2. **Spring servlet 404 with "Skill not found"** → :class:`DialogsSkillNotFoundError`.
-    3. **Spring servlet 4xx/5xx** → :class:`DialogsValidationError` (404/400) or
+    1. **HTTP 401 (any body)** → :class:`DialogsAuthError`. 401 is unambiguously
+       an authentication signal per HTTP semantics; body shape is irrelevant.
+    2. **HTML 403** → :class:`DialogsAuthError` (CSRF/cookies-expired auth wall).
+       Non-HTML 403 falls through to body-based parsing — Yandex also uses 403
+       for domain-level "forbidden" responses.
+    3. **Spring servlet 404 with "Skill not found"** → :class:`DialogsSkillNotFoundError`.
+    4. **Spring servlet 4xx/5xx** → :class:`DialogsValidationError` (404/400) or
        :class:`DialogsApiError` (else), with ``yandex_error`` populated from
        ``message``.
-    4. **Domain validation** ``{error: {message, code, fields}}`` →
+    5. **Domain validation** ``{error: {message, code, fields}}`` →
        :class:`DialogsValidationError` with ``fields`` filled.
-    5. **Top-level JSON error** ``{error|errorCode|message|code: "..."}`` →
+    6. **Top-level JSON error** ``{error|errorCode|message|code: "..."}`` →
        :class:`DialogsApiError` with ``yandex_error`` populated.
-    6. Otherwise — generic :class:`DialogsApiError`.
+    7. Otherwise — generic :class:`DialogsApiError`.
     """
-    # 1. HTML auth wall
-    if _looks_like_html(body) and http_status in (401, 403):
+    # 1. HTTP 401 always means auth, regardless of body shape.
+    if http_status == 401:
+        return DialogsAuthError(
+            f"Yandex returned HTTP 401 — CSRF / cookies missing or expired: "
+            f"{body[:200] or '<empty>'}",
+            step=step,
+            http_status=http_status,
+        )
+    # 2. HTML 403 is the auth-wall variant (non-HTML 403 falls through).
+    if http_status == 403 and _looks_like_html(body):
         return DialogsAuthError(
             "Yandex returned HTML auth response — CSRF / cookies missing or expired",
             step=step,
