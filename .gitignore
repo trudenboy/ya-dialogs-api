@@ -57,3 +57,9 @@ sbom.json
 
 # Local test artifacts
 manual_qr_output.txt
+
+# Playwright research raw captures (may contain session cookies / PII)
+research/network/
+research/snapshots/
+research/har/
+.playwright-mcp/
