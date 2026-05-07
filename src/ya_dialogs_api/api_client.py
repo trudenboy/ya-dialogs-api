@@ -155,9 +155,7 @@ class IntentDraft:
             positive_tests=str(raw.get("positiveTests") or ""),
             negative_tests=str(raw.get("negativeTests") or ""),
             is_activation=bool(raw.get("isActivation", False)),
-            intent_id=(
-                str(raw["id"]) if isinstance(raw.get("id"), str) and raw["id"] else None
-            ),
+            intent_id=(str(raw["id"]) if isinstance(raw.get("id"), str) and raw["id"] else None),
             status=str(raw.get("status") or "NEW"),
         )
 
@@ -471,10 +469,7 @@ class DialogsSkillCreator:
         channel — calling this on a smart-home skill returns an empty
         list at the API level.
         """
-        url = (
-            f"{DIALOGS_API_BASE}/apps/{skill_id}/intents/drafts"
-            f"?channel={DIALOG_CHANNEL}"
-        )
+        url = f"{DIALOGS_API_BASE}/apps/{skill_id}/intents/drafts?channel={DIALOG_CHANNEL}"
         data = await self._get_json(url, csrf=csrf, step="list_intents")
         result = data.get("result")
         # Yandex returns either a top-level list or a wrapped {result: [...]}.
@@ -482,18 +477,10 @@ class DialogsSkillCreator:
         # defensive against future protocol revisions.
         items: Any = result if isinstance(result, list) else data
         if not isinstance(items, list):
-            raise DialogsApiError(
-                "list_intents response missing list payload", step="list_intents"
-            )
-        return [
-            IntentDraft.from_api_dict(item)
-            for item in items
-            if isinstance(item, dict)
-        ]
+            raise DialogsApiError("list_intents response missing list payload", step="list_intents")
+        return [IntentDraft.from_api_dict(item) for item in items if isinstance(item, dict)]
 
-    async def get_intent(
-        self, csrf: str, skill_id: str, intent_id: str
-    ) -> IntentDraft:
+    async def get_intent(self, csrf: str, skill_id: str, intent_id: str) -> IntentDraft:
         """Fetch a single intent draft by id."""
         url = (
             f"{DIALOGS_API_BASE}/apps/{skill_id}/intents/drafts/{intent_id}"
@@ -502,9 +489,7 @@ class DialogsSkillCreator:
         data = await self._get_json(url, csrf=csrf, step="get_intent")
         result = data.get("result")
         if not isinstance(result, dict):
-            raise DialogsApiError(
-                "get_intent response missing 'result'", step="get_intent"
-            )
+            raise DialogsApiError("get_intent response missing 'result'", step="get_intent")
         return IntentDraft.from_api_dict(result)
 
     async def create_intent(self, csrf: str, skill_id: str) -> IntentDraft:
@@ -515,26 +500,17 @@ class DialogsSkillCreator:
         the actual content. :meth:`update_intent` covers the PATCH half;
         :meth:`set_intents` chains both for declarative use.
         """
-        url = (
-            f"{DIALOGS_API_BASE}/apps/{skill_id}/intents/draft"
-            f"?channel={DIALOG_CHANNEL}"
-        )
+        url = f"{DIALOGS_API_BASE}/apps/{skill_id}/intents/draft?channel={DIALOG_CHANNEL}"
         data = await self._post_json(url, {}, csrf=csrf, step="create_intent")
         result = data.get("result")
         if not isinstance(result, dict):
-            raise DialogsApiError(
-                "create_intent response missing 'result'", step="create_intent"
-            )
+            raise DialogsApiError("create_intent response missing 'result'", step="create_intent")
         intent = IntentDraft.from_api_dict(result)
         if intent.intent_id is None:
-            raise DialogsApiError(
-                "create_intent response missing intent id", step="create_intent"
-            )
+            raise DialogsApiError("create_intent response missing intent id", step="create_intent")
         return intent
 
-    async def update_intent(
-        self, csrf: str, skill_id: str, intent: IntentDraft
-    ) -> IntentDraft:
+    async def update_intent(self, csrf: str, skill_id: str, intent: IntentDraft) -> IntentDraft:
         """PATCH an existing intent's content. Server validates grammar synchronously.
 
         On valid grammar: returns the saved :class:`IntentDraft` with
@@ -557,14 +533,10 @@ class DialogsSkillCreator:
             f"{DIALOGS_API_BASE}/apps/{skill_id}/intents/{intent.intent_id}/draft"
             f"?channel={DIALOG_CHANNEL}"
         )
-        data = await self._patch_json(
-            url, intent.to_api_dict(), csrf=csrf, step="update_intent"
-        )
+        data = await self._patch_json(url, intent.to_api_dict(), csrf=csrf, step="update_intent")
         result = data.get("result")
         if not isinstance(result, dict):
-            raise DialogsApiError(
-                "update_intent response missing 'result'", step="update_intent"
-            )
+            raise DialogsApiError("update_intent response missing 'result'", step="update_intent")
         intent_raw = result.get("intent")
         if not isinstance(intent_raw, dict):
             raise DialogsApiError(
@@ -602,9 +574,7 @@ class DialogsSkillCreator:
         async with self._session.delete(url, headers=headers) as resp:
             body = await resp.text()
             if resp.status not in (200, 204):
-                raise parse_error_body(
-                    body, http_status=resp.status, step="delete_intent"
-                )
+                raise parse_error_body(body, http_status=resp.status, step="delete_intent")
 
     async def set_intents(
         self,

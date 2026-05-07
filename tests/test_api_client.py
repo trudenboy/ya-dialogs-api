@@ -1460,9 +1460,7 @@ class TestIntentCRUD:
             ),
         )
         creator = DialogsSkillCreator(session, channel=DIALOG_CHANNEL)
-        intent = IntentDraft(
-            form_name="control.pause", source_text="broken", intent_id="u1"
-        )
+        intent = IntentDraft(form_name="control.pause", source_text="broken", intent_id="u1")
         with pytest.raises(DialogsIntentValidationError) as exc_info:
             await creator.update_intent("csrf", "skill-1", intent)
         assert exc_info.value.error_code == "VALIDATION_ERROR"
@@ -1575,9 +1573,7 @@ class TestIntentCRUD:
                 source_text="root: включи",
             ),  # new → POST + PATCH
         ]
-        result = await creator.set_intents(
-            "csrf", "skill-1", desired, delete_missing=False
-        )
+        result = await creator.set_intents("csrf", "skill-1", desired, delete_missing=False)
         # Two intents end-state.
         assert len(result) == 2
         assert {i.form_name for i in result} == {"control.pause", "play.specific"}
