@@ -1467,6 +1467,12 @@ class TestIntentCRUD:
         assert exc_info.value.line_number == 1
         assert exc_info.value.intent_id == "u1"
         assert exc_info.value.form_name == "control.pause"
+        # Stringified form surfaces form_name + position so logs at the
+        # orchestrator level (which print str(exc)) point at the
+        # offending intent without callers having to introspect.
+        msg = str(exc_info.value)
+        assert "[control.pause]" in msg
+        assert "line=1" in msg
 
     @pytest.mark.asyncio
     async def test_update_intent_without_id_raises(self) -> None:

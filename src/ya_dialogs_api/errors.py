@@ -173,7 +173,28 @@ class DialogsIntentValidationError(DialogsValidationError):
         form_name: str | None = None,
     ) -> None:
         """Initialise with the validation block details."""
-        super().__init__(message, step=step, yandex_error=message)
+        # Build a richer textual representation that surfaces the
+        # offending intent's form_name and error position. The base
+        # ``message`` carries the human-readable error from Yandex (e.g.
+        # "Неизвестный элемент 'root'" or "Некорректный аргумент"); on
+        # its own that's not enough to find the failing intent in a
+        # multi-grammar set_intents() call. We prepend ``[form_name]`` /
+        # ``[intent_id]`` and append the position when it's known.
+        parts: list[str] = []
+        if form_name:
+            parts.append(f"[{form_name}]")
+        elif intent_id:
+            parts.append(f"[id={intent_id}]")
+        parts.append(message)
+        if line_number > 0 or char_offset >= 0:
+            location = f"line={line_number} offset={char_offset}"
+            if char_count >= 0:
+                location += f" len={char_count}"
+            parts.append(f"({location})")
+        if error_code and error_code != "VALIDATION_ERROR":
+            parts.append(f"[{error_code}]")
+        enriched = " ".join(parts)
+        super().__init__(enriched, step=step, yandex_error=message)
         self.error_code = error_code
         self.char_count = char_count
         self.char_offset = char_offset

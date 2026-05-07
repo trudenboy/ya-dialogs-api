@@ -6,6 +6,34 @@ All notable changes to this project will be documented in this file. The format 
 
 ## [Unreleased]
 
+## [2.1.1] — 2026-05-08
+
+### Changed
+
+- **`DialogsIntentValidationError.__str__` now includes `form_name` and
+  the error position.** Previously the orchestrator's `auto-create
+  failed at update_intent: <text>` log line surfaced only the
+  human-readable message ("Некорректный аргумент",
+  "Неизвестный элемент 'root'", …) which on its own does not identify
+  which intent in a multi-grammar `set_intents()` call broke. Errors
+  now render as `[<form_name>] <text> (line=N offset=N len=N)
+  [<errorCode>]` so a single log line points at the offending intent.
+  Typed accessors (`error_code`, `line_number`, `char_offset`,
+  `char_count`, `intent_id`, `form_name`) are unchanged.
+- **`set_intents` logs per-intent progress** at INFO level: every
+  create / patch step prints `[i/N] form_name=… (id=…)` so a failure
+  on intent N can be located even without DEBUG enabled. Unchanged
+  intents (matched by content) still log at DEBUG only.
+
+### Added
+
+- **DEBUG-level dump of the rejected request payload** in
+  `update_intent` when a `validationError` block is returned. Helps
+  diagnose payload-shape errors (vs grammar parse errors) by showing
+  the exact body Yandex saw alongside the validationError block —
+  enable with `--log-level=debug` on the host application or set the
+  `ya_dialogs_api.api_client` logger to DEBUG.
+
 ## [2.1.0] — 2026-05-07
 
 Adds programmatic management of Yandex Dialogs custom intents (NLU grammar)

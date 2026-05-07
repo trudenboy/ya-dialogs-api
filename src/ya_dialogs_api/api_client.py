@@ -550,6 +550,18 @@ class DialogsSkillCreator:
                 char_count = int(bounds.get("charCount", -1) or -1)
                 char_offset = int(bounds.get("charOffset", -1) or -1)
                 line_number = int(bounds.get("lineNumber", -1) or -1)
+            # DEBUG-level raw dump so a postmortem with --log-level=debug
+            # in the host MA can see the exact payload Yandex rejected.
+            # Helpful for messages like "Некорректный аргумент" that don't
+            # by themselves identify the offending field.
+            _LOGGER.debug(
+                "update_intent validation failure: form_name=%r id=%s "
+                "validationError=%r request_payload=%r",
+                intent.form_name,
+                intent.intent_id,
+                validation_error,
+                intent.to_api_dict(),
+            )
             raise DialogsIntentValidationError(
                 str(validation_error.get("text") or "Grammar validation failed"),
                 step="update_intent",
@@ -612,10 +624,16 @@ class DialogsSkillCreator:
 
         out: list[IntentDraft] = []
         seen_form_names: set[str] = set()
-        for desired in intents:
+        for index, desired in enumerate(intents):
             seen_form_names.add(desired.form_name)
             current = existing_by_form.get(desired.form_name)
             if current is None:
+                _LOGGER.info(
+                    "set_intents [%d/%d]: creating new intent form_name=%r",
+                    index + 1,
+                    len(intents),
+                    desired.form_name,
+                )
                 created = await self.create_intent(csrf, skill_id)
                 merged = dataclasses.replace(desired, intent_id=created.intent_id)
                 out.append(await self.update_intent(csrf, skill_id, merged))
@@ -629,8 +647,22 @@ class DialogsSkillCreator:
                 and merged.negative_tests == current.negative_tests
                 and merged.is_activation == current.is_activation
             ):
+                _LOGGER.debug(
+                    "set_intents [%d/%d]: skipping unchanged form_name=%r id=%s",
+                    index + 1,
+                    len(intents),
+                    desired.form_name,
+                    current.intent_id,
+                )
                 out.append(current)
                 continue
+            _LOGGER.info(
+                "set_intents [%d/%d]: patching existing form_name=%r id=%s",
+                index + 1,
+                len(intents),
+                desired.form_name,
+                current.intent_id,
+            )
             out.append(await self.update_intent(csrf, skill_id, merged))
 
         if delete_missing:
