@@ -6,6 +6,66 @@ All notable changes to this project will be documented in this file. The format 
 
 ## [Unreleased]
 
+## [2.1.0] — 2026-05-07
+
+Adds programmatic management of Yandex Dialogs custom intents (NLU grammar)
+on `aliceSkill` skills. Previously, intents could only be created and edited
+via the dev-console UI; this release wraps the `/apps/{id}/intents` REST
+surface so callers can declare grammars in code and sync them through the
+existing `auto_create_skill` / `auto_update_skill` pipelines.
+
+The endpoints and payload shape were derived from a Playwright probe of
+the live dev console (`dialogs.yandex.ru`) on 2026-05-07; see
+`RESEARCH.md` § 7 for the full network capture.
+
+### Added
+
+- **API:** `IntentDraft` dataclass — typed local representation of a
+  custom-intent definition (`form_name`, `human_readable_name`,
+  `source_text`, `positive_tests`, `negative_tests`, `is_activation`,
+  `intent_id`, `status`). `from_api_dict` / `to_api_dict` for codec
+  round-trips against the server payload.
+- **API:** `DialogsIntentValidationError` — typed error for synchronous
+  grammar-validation failures returned by Yandex (HTTP 200 + a
+  `validationError` block inside the result). Carries `error_code`,
+  `text`, and the `(char_count, char_offset, line_number)` triple Yandex
+  uses to locate the error in `source_text`.
+- **API:** Five new methods on `DialogsSkillCreator`:
+    - `list_intents(csrf, skill_id)` — `GET /apps/{id}/intents/drafts`
+    - `get_intent(csrf, skill_id, intent_id)` — `GET /apps/{id}/intents/drafts/{id}`
+    - `create_intent(csrf, skill_id)` — `POST /apps/{id}/intents/draft`
+      (empty body — server generates the UUID; pair with `update_intent`)
+    - `update_intent(csrf, skill_id, intent: IntentDraft)` —
+      `PATCH /apps/{id}/intents/{id}/draft`. Returns the saved intent on
+      valid grammar; raises `DialogsIntentValidationError` on validation
+      failure. The previously valid version remains effective at runtime.
+    - `delete_intent(csrf, skill_id, intent_id)` — `DELETE` (note: this
+      single endpoint omits the `?channel` query parameter, verified
+      empirically).
+- **API:** `DialogsSkillCreator.set_intents(csrf, skill_id, intents,
+  delete_missing=True)` — declarative idempotent setter. Diffs the
+  desired list against the live server state (matched by `form_name`),
+  issuing the minimum POST/PATCH/DELETE sequence. Re-runnable safely.
+- **Orchestrators:** `auto_create_skill` and `auto_update_skill` accept
+  a new `intents: list[IntentDraft] | None = None` keyword argument.
+  `None` leaves whatever's on the server alone; `[]` clears all custom
+  intents. Sync runs between the draft update and `request_deploy` so
+  intents land in the same moderation cycle as the rest of the draft —
+  no second-publish round-trip required.
+- **Pipeline:** New internal `_step_set_intents` step in `_execute_pipeline`,
+  inserted between OAuth attach (or draft update for OAuth-free skills)
+  and the deploy checkpoint. No-op for `channel="smartHome"` (custom
+  intents are an `aliceSkill`-only feature).
+
+### Notes
+
+- Intent CRUD is hard-coded to `channel=aliceSkill` regardless of the
+  `DialogsSkillCreator`'s configured channel — Yandex's API rejects the
+  same routes on the smart-home channel, so we don't expose the choice.
+- The `is_activation` field is included in the dataclass and round-tripped
+  faithfully, but its server-side semantics (relationship to the legacy
+  `activationPhrases` array on the main draft) are not yet documented.
+
 ## [2.0.0] — 2026-05-06
 
 This release combines an `aliceSkill` OAuth-free pipeline (originally drafted

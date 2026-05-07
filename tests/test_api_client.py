@@ -22,9 +22,11 @@ from ya_dialogs_api import (
     DialogsAuthError,
     DialogsCsrfError,
     DialogsDuplicateSkillError,
+    DialogsIntentValidationError,
     DialogsSkillCreator,
     DialogsSkillNotFoundError,
     DialogsValidationError,
+    IntentDraft,
     SkillCreationArtifacts,
     SkillCreationState,
     auto_create_skill,
@@ -1242,6 +1244,378 @@ class TestDeleteSkill:
             await creator.delete_skill("csrf", "12345678-aaaa-bbbb-cccc-1234567890ab")
         assert exc_info.value.skill_id == "12345678-aaaa-bbbb-cccc-1234567890ab"
         assert exc_info.value.http_status == 404
+
+
+# ---------------------------------------------------------------------------
+# Intent CRUD (aliceSkill custom NLU grammar)
+# ---------------------------------------------------------------------------
+
+
+class TestIntentDraft:
+    """Encode/decode round-trip for the IntentDraft dataclass."""
+
+    def test_from_api_dict_full(self) -> None:
+        """All fields decoded from a server-shaped payload."""
+        intent = IntentDraft.from_api_dict(
+            {
+                "id": "uuid-1",
+                "humanReadableName": "Pause music",
+                "formName": "control.pause",
+                "sourceText": "root: пауза",
+                "positiveTests": "пауза\nстоп",
+                "negativeTests": "включи",
+                "isActivation": False,
+                "status": "NEW",
+            }
+        )
+        assert intent.intent_id == "uuid-1"
+        assert intent.form_name == "control.pause"
+        assert intent.source_text == "root: пауза"
+        assert intent.status == "NEW"
+
+    def test_from_api_dict_missing_id_yields_none(self) -> None:
+        """Empty / missing id is normalised to None (locally-built intent)."""
+        intent = IntentDraft.from_api_dict({"formName": "x", "id": ""})
+        assert intent.intent_id is None
+
+    def test_to_api_dict_includes_id_when_present(self) -> None:
+        """to_api_dict injects ``id`` only when intent_id is set (PATCH path)."""
+        with_id = IntentDraft(form_name="x", intent_id="abc").to_api_dict()
+        assert with_id["id"] == "abc"
+        without_id = IntentDraft(form_name="x").to_api_dict()
+        assert "id" not in without_id
+
+
+class TestIntentCRUD:
+    """list / get / create / update / delete / set_intents on DialogsSkillCreator."""
+
+    @pytest.mark.asyncio
+    async def test_list_intents_returns_decoded_drafts(self) -> None:
+        """GET /apps/{id}/intents/drafts decodes to list[IntentDraft]."""
+        session = _make_session()
+        _install_ctx(
+            session.get,
+            _mock_response(
+                status=200,
+                body_json={
+                    "result": [
+                        {"id": "u1", "formName": "play.specific", "sourceText": "root: x"},
+                        {"id": "u2", "formName": "control.pause"},
+                    ]
+                },
+            ),
+        )
+        creator = DialogsSkillCreator(session, channel=DIALOG_CHANNEL)
+        intents = await creator.list_intents("csrf", "skill-1")
+        assert [i.form_name for i in intents] == ["play.specific", "control.pause"]
+        # Channel hard-coded to aliceSkill regardless of creator's channel.
+        url = session.get.call_args.args[0]
+        assert "channel=aliceSkill" in url
+        assert "/apps/skill-1/intents/drafts" in url
+
+    @pytest.mark.asyncio
+    async def test_get_intent_decodes_single(self) -> None:
+        """GET /apps/{id}/intents/drafts/{intent_id} returns IntentDraft."""
+        session = _make_session()
+        _install_ctx(
+            session.get,
+            _mock_response(
+                status=200,
+                body_json={
+                    "result": {
+                        "id": "u1",
+                        "formName": "play.specific",
+                        "humanReadableName": "Play",
+                        "sourceText": "root: x",
+                        "positiveTests": "p",
+                        "negativeTests": "n",
+                        "isActivation": False,
+                        "status": "NEW",
+                    }
+                },
+            ),
+        )
+        creator = DialogsSkillCreator(session, channel=DIALOG_CHANNEL)
+        intent = await creator.get_intent("csrf", "skill-1", "u1")
+        assert intent.intent_id == "u1"
+        assert intent.form_name == "play.specific"
+        assert intent.human_readable_name == "Play"
+
+    @pytest.mark.asyncio
+    async def test_create_intent_returns_server_id(self) -> None:
+        """POST /apps/{id}/intents/draft with empty body returns server-assigned UUID."""
+        session = _make_session()
+        _install_ctx(
+            session.request,
+            _mock_response(
+                status=200,
+                body_json={
+                    "result": {
+                        "id": "fresh-uuid",
+                        "humanReadableName": "",
+                        "formName": "",
+                        "sourceText": "",
+                        "positiveTests": "",
+                        "negativeTests": "",
+                        "isActivation": False,
+                        "status": "NEW",
+                    }
+                },
+            ),
+        )
+        creator = DialogsSkillCreator(session, channel=DIALOG_CHANNEL)
+        intent = await creator.create_intent("csrf", "skill-1")
+        assert intent.intent_id == "fresh-uuid"
+        # Empty POST body
+        method, url = session.request.call_args.args[:2]
+        assert method == "POST"
+        assert "/intents/draft" in url
+        assert session.request.call_args.kwargs["json"] == {}
+
+    @pytest.mark.asyncio
+    async def test_create_intent_missing_id_raises(self) -> None:
+        """A 200 response without id → DialogsApiError (protocol break)."""
+        session = _make_session()
+        _install_ctx(
+            session.request,
+            _mock_response(status=200, body_json={"result": {}}),
+        )
+        creator = DialogsSkillCreator(session, channel=DIALOG_CHANNEL)
+        with pytest.raises(DialogsApiError):
+            await creator.create_intent("csrf", "skill-1")
+
+    @pytest.mark.asyncio
+    async def test_update_intent_happy_path_returns_saved(self) -> None:
+        """PATCH with valid grammar returns the saved IntentDraft (no validationError)."""
+        session = _make_session()
+        _install_ctx(
+            session.request,
+            _mock_response(
+                status=200,
+                body_json={
+                    "result": {
+                        "intent": {
+                            "id": "u1",
+                            "humanReadableName": "Pause",
+                            "formName": "control.pause",
+                            "sourceText": "root: пауза",
+                            "positiveTests": "пауза",
+                            "negativeTests": "",
+                            "isActivation": False,
+                            "status": "NEW",
+                        }
+                    }
+                },
+            ),
+        )
+        creator = DialogsSkillCreator(session, channel=DIALOG_CHANNEL)
+        intent = IntentDraft(
+            form_name="control.pause",
+            human_readable_name="Pause",
+            source_text="root: пауза",
+            positive_tests="пауза",
+            intent_id="u1",
+        )
+        saved = await creator.update_intent("csrf", "skill-1", intent)
+        assert saved.status == "NEW"
+        # PATCH body carried our payload
+        method, url = session.request.call_args.args[:2]
+        assert method == "PATCH"
+        assert "/intents/u1/draft" in url
+        body = session.request.call_args.kwargs["json"]
+        assert body["sourceText"] == "root: пауза"
+        assert body["formName"] == "control.pause"
+
+    @pytest.mark.asyncio
+    async def test_update_intent_invalid_grammar_raises_typed_error(self) -> None:
+        """Server-side grammar errors surface as DialogsIntentValidationError."""
+        session = _make_session()
+        _install_ctx(
+            session.request,
+            _mock_response(
+                status=200,
+                body_json={
+                    "result": {
+                        "intent": {
+                            "id": "u1",
+                            "formName": "control.pause",
+                            "humanReadableName": "P",
+                            "sourceText": "broken",
+                            "positiveTests": "",
+                            "negativeTests": "",
+                            "isActivation": False,
+                            "status": "INVALID_GRAMMAR",
+                        },
+                        "validationError": {
+                            "errorCode": "VALIDATION_ERROR",
+                            "errorBounds": {
+                                "charCount": 7,
+                                "charOffset": 0,
+                                "lineNumber": 1,
+                            },
+                            "text": 'Неизвестный элемент "broken"',
+                        },
+                    }
+                },
+            ),
+        )
+        creator = DialogsSkillCreator(session, channel=DIALOG_CHANNEL)
+        intent = IntentDraft(
+            form_name="control.pause", source_text="broken", intent_id="u1"
+        )
+        with pytest.raises(DialogsIntentValidationError) as exc_info:
+            await creator.update_intent("csrf", "skill-1", intent)
+        assert exc_info.value.error_code == "VALIDATION_ERROR"
+        assert exc_info.value.line_number == 1
+        assert exc_info.value.intent_id == "u1"
+        assert exc_info.value.form_name == "control.pause"
+
+    @pytest.mark.asyncio
+    async def test_update_intent_without_id_raises(self) -> None:
+        """update_intent on a locally-built intent (no intent_id) is a programmer error."""
+        session = _make_session()
+        creator = DialogsSkillCreator(session, channel=DIALOG_CHANNEL)
+        intent = IntentDraft(form_name="control.pause")  # no intent_id
+        with pytest.raises(DialogsApiError):
+            await creator.update_intent("csrf", "skill-1", intent)
+
+    @pytest.mark.asyncio
+    async def test_delete_intent_omits_channel_param(self) -> None:
+        """DELETE /apps/{id}/intents/{intent_id}/draft does NOT carry ?channel."""
+        session = _make_session()
+        session.delete = MagicMock()
+        _install_ctx(session.delete, _mock_response(status=200, body_text="{}"))
+        creator = DialogsSkillCreator(session, channel=DIALOG_CHANNEL)
+        await creator.delete_intent("csrf", "skill-1", "u1")
+        url = session.delete.call_args.args[0]
+        assert "/apps/skill-1/intents/u1/draft" in url
+        assert "channel=" not in url
+
+    @pytest.mark.asyncio
+    async def test_set_intents_creates_new_and_patches_changed(self) -> None:
+        """set_intents POSTs new ones, PATCHes changed ones, leaves identical alone."""
+        session = _make_session()
+        # Sequence:
+        # 1. list_intents → returns one existing intent (formName='control.pause')
+        # 2. POST create → new intent shell for 'play.specific'
+        # 3. PATCH the new intent with our content
+        # No PATCH for control.pause (our copy is identical to server's).
+        session.get = MagicMock()
+        session.request = MagicMock()
+        # GET response for list_intents
+        list_resp = _mock_response(
+            status=200,
+            body_json={
+                "result": [
+                    {
+                        "id": "existing-uuid",
+                        "formName": "control.pause",
+                        "humanReadableName": "Pause",
+                        "sourceText": "root: пауза",
+                        "positiveTests": "",
+                        "negativeTests": "",
+                        "isActivation": False,
+                        "status": "NEW",
+                    }
+                ]
+            },
+        )
+        _install_ctx(session.get, list_resp)
+        # POST + PATCH chained — return values per call.
+        responses = [
+            # POST create → returns new shell with id
+            _mock_response(
+                status=200,
+                body_json={
+                    "result": {
+                        "id": "new-uuid",
+                        "formName": "",
+                        "humanReadableName": "",
+                        "sourceText": "",
+                        "positiveTests": "",
+                        "negativeTests": "",
+                        "isActivation": False,
+                        "status": "NEW",
+                    }
+                },
+            ),
+            # PATCH update → returns saved intent
+            _mock_response(
+                status=200,
+                body_json={
+                    "result": {
+                        "intent": {
+                            "id": "new-uuid",
+                            "formName": "play.specific",
+                            "humanReadableName": "Play",
+                            "sourceText": "root: включи",
+                            "positiveTests": "",
+                            "negativeTests": "",
+                            "isActivation": False,
+                            "status": "NEW",
+                        }
+                    }
+                },
+            ),
+        ]
+        request_ctx = MagicMock()
+        request_ctx.__aenter__ = AsyncMock(side_effect=responses)
+        request_ctx.__aexit__ = AsyncMock(return_value=False)
+        session.request.return_value = request_ctx
+        creator = DialogsSkillCreator(session, channel=DIALOG_CHANNEL)
+        desired = [
+            IntentDraft(
+                form_name="control.pause",
+                human_readable_name="Pause",
+                source_text="root: пауза",
+            ),  # identical to server → no PATCH
+            IntentDraft(
+                form_name="play.specific",
+                human_readable_name="Play",
+                source_text="root: включи",
+            ),  # new → POST + PATCH
+        ]
+        result = await creator.set_intents(
+            "csrf", "skill-1", desired, delete_missing=False
+        )
+        # Two intents end-state.
+        assert len(result) == 2
+        assert {i.form_name for i in result} == {"control.pause", "play.specific"}
+        # Two requests: POST create, PATCH update. NO PATCH for control.pause.
+        assert session.request.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_set_intents_deletes_missing_when_flag_set(self) -> None:
+        """delete_missing=True removes server intents whose form_name is not in desired."""
+        session = _make_session()
+        session.get = MagicMock()
+        session.delete = MagicMock()
+        # Server has one intent; we pass empty desired → it gets deleted.
+        list_resp = _mock_response(
+            status=200,
+            body_json={
+                "result": [
+                    {
+                        "id": "stale-uuid",
+                        "formName": "old.intent",
+                        "sourceText": "",
+                        "positiveTests": "",
+                        "negativeTests": "",
+                        "isActivation": False,
+                        "status": "NEW",
+                    }
+                ]
+            },
+        )
+        _install_ctx(session.get, list_resp)
+        _install_ctx(session.delete, _mock_response(status=200, body_text="{}"))
+        creator = DialogsSkillCreator(session, channel=DIALOG_CHANNEL)
+        result = await creator.set_intents("csrf", "skill-1", [], delete_missing=True)
+        assert result == []
+        # DELETE was called once for the stale intent.
+        assert session.delete.call_count == 1
+        url = session.delete.call_args.args[0]
+        assert "/intents/stale-uuid/draft" in url
 
 
 # ---------------------------------------------------------------------------

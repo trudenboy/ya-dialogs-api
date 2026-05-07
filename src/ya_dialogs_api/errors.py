@@ -48,6 +48,7 @@ __all__ = [
     "DialogsAuthError",
     "DialogsCsrfError",
     "DialogsDuplicateSkillError",
+    "DialogsIntentValidationError",
     "DialogsSkillNotFoundError",
     "DialogsValidationError",
     "parse_error_body",
@@ -144,6 +145,41 @@ class DialogsSkillNotFoundError(DialogsApiError):
 
 class DialogsDuplicateSkillError(DialogsApiError):
     """Raised when create_app rejects because a skill with the same name exists."""
+
+
+class DialogsIntentValidationError(DialogsValidationError):
+    """Raised when Yandex rejects an intent grammar at PATCH time.
+
+    Custom-intent updates use a soft-failure protocol: HTTP 200 with the
+    saved-but-invalid intent and a ``validationError`` block describing
+    what was wrong with the grammar. This error wraps that block so
+    callers can inspect ``error_code``, the human-readable ``text``, and
+    the error position in ``sourceText`` (for editor highlighting).
+
+    Position fields use ``-1`` when Yandex couldn't pin the location
+    (typically: empty grammar, or top-level structural errors).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        step: str,
+        error_code: str,
+        char_count: int,
+        char_offset: int,
+        line_number: int,
+        intent_id: str | None = None,
+        form_name: str | None = None,
+    ) -> None:
+        """Initialise with the validation block details."""
+        super().__init__(message, step=step, yandex_error=message)
+        self.error_code = error_code
+        self.char_count = char_count
+        self.char_offset = char_offset
+        self.line_number = line_number
+        self.intent_id = intent_id
+        self.form_name = form_name
 
 
 # ---------------------------------------------------------------------------

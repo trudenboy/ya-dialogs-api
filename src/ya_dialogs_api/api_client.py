@@ -42,6 +42,7 @@ from .errors import (
     DialogsAuthError,
     DialogsCsrfError,
     DialogsDuplicateSkillError,
+    DialogsIntentValidationError,
     DialogsSkillNotFoundError,
     DialogsValidationError,
     parse_error_body,
@@ -76,9 +77,11 @@ __all__ = [
     "DialogsAuthError",
     "DialogsCsrfError",
     "DialogsDuplicateSkillError",
+    "DialogsIntentValidationError",
     "DialogsSkillCreator",
     "DialogsSkillNotFoundError",
     "DialogsValidationError",
+    "IntentDraft",
     "auto_create_skill",
     "auto_update_skill",
     "build_dialog_draft_payload",
@@ -103,6 +106,80 @@ DIALOGS_API_BASE = f"{DIALOGS_DEV_BASE}/developer/app-store-api"
 DIALOGS_CSRF_REGEX = re.compile(r'"secretkey":"([^"]+)"')
 
 _MAX_HTML_RESPONSE_BYTES = 2 * 1024 * 1024  # 2 MiB
+
+# ---------------------------------------------------------------------------
+# Custom-intent grammar support (aliceSkill channel only)
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class IntentDraft:
+    """Single Yandex Dialogs custom-intent definition.
+
+    Maps 1:1 to the API payload at ``/apps/{id}/intents/{id}/draft``. The
+    intent system is part of the dialog channel (``aliceSkill``) only;
+    smart-home skills don't have a custom NLU layer.
+
+    Two identifiers, both meaningful:
+
+    * ``form_name`` — developer-facing string used in grammar source
+      (``intent: play.specific``) and surfaced as ``request.nlu.intents.<form_name>``
+      to the skill webhook. Stable across edits — the diff/upsert protocol
+      in :meth:`DialogsSkillCreator.set_intents` keys on this.
+    * ``intent_id`` — server-assigned UUID, returned by ``create_intent``
+      and required for ``update_intent`` / ``delete_intent``. ``None`` for
+      a freshly-built local definition.
+
+    ``status`` is set by the server: ``NEW`` for a freshly-saved valid
+    intent, ``INVALID_GRAMMAR`` when the most recent PATCH carried bad
+    grammar (the previous valid version stays effective). Other values
+    documented sparsely by Yandex; treat as opaque.
+    """
+
+    form_name: str
+    human_readable_name: str = ""
+    source_text: str = ""
+    positive_tests: str = ""
+    negative_tests: str = ""
+    is_activation: bool = False
+    intent_id: str | None = None
+    status: str = "NEW"
+
+    @classmethod
+    def from_api_dict(cls, raw: Mapping[str, Any]) -> IntentDraft:
+        """Decode a single intent payload as returned by the API."""
+        return cls(
+            form_name=str(raw.get("formName") or ""),
+            human_readable_name=str(raw.get("humanReadableName") or ""),
+            source_text=str(raw.get("sourceText") or ""),
+            positive_tests=str(raw.get("positiveTests") or ""),
+            negative_tests=str(raw.get("negativeTests") or ""),
+            is_activation=bool(raw.get("isActivation", False)),
+            intent_id=(
+                str(raw["id"]) if isinstance(raw.get("id"), str) and raw["id"] else None
+            ),
+            status=str(raw.get("status") or "NEW"),
+        )
+
+    def to_api_dict(self) -> dict[str, Any]:
+        """Encode for use in PATCH payloads.
+
+        ``id`` is included when known (PATCH path requires it); ``status``
+        is sent as the client-known last value but Yandex re-computes it.
+        """
+        payload: dict[str, Any] = {
+            "humanReadableName": self.human_readable_name,
+            "formName": self.form_name,
+            "sourceText": self.source_text,
+            "positiveTests": self.positive_tests,
+            "negativeTests": self.negative_tests,
+            "isActivation": self.is_activation,
+            "status": self.status,
+        }
+        if self.intent_id is not None:
+            payload["id"] = self.intent_id
+        return payload
+
 
 # ---------------------------------------------------------------------------
 # Client
@@ -381,6 +458,217 @@ class DialogsSkillCreator:
             body = await resp.text()
             if resp.status not in (200, 204):
                 raise parse_error_body(body, http_status=resp.status, step="delete_skill")
+
+    # -----------------------------------------------------------------------
+    # Custom-intent management (aliceSkill channel only)
+    # -----------------------------------------------------------------------
+
+    async def list_intents(self, csrf: str, skill_id: str) -> list[IntentDraft]:
+        """List all custom-intent drafts for the skill.
+
+        Channel is hard-coded to ``aliceSkill`` regardless of
+        ``self._channel`` because intents only exist on the dialog
+        channel — calling this on a smart-home skill returns an empty
+        list at the API level.
+        """
+        url = (
+            f"{DIALOGS_API_BASE}/apps/{skill_id}/intents/drafts"
+            f"?channel={DIALOG_CHANNEL}"
+        )
+        data = await self._get_json(url, csrf=csrf, step="list_intents")
+        result = data.get("result")
+        # Yandex returns either a top-level list or a wrapped {result: [...]}.
+        # Probed shape was the wrapped form; the unwrapped fallback is
+        # defensive against future protocol revisions.
+        items: Any = result if isinstance(result, list) else data
+        if not isinstance(items, list):
+            raise DialogsApiError(
+                "list_intents response missing list payload", step="list_intents"
+            )
+        return [
+            IntentDraft.from_api_dict(item)
+            for item in items
+            if isinstance(item, dict)
+        ]
+
+    async def get_intent(
+        self, csrf: str, skill_id: str, intent_id: str
+    ) -> IntentDraft:
+        """Fetch a single intent draft by id."""
+        url = (
+            f"{DIALOGS_API_BASE}/apps/{skill_id}/intents/drafts/{intent_id}"
+            f"?channel={DIALOG_CHANNEL}"
+        )
+        data = await self._get_json(url, csrf=csrf, step="get_intent")
+        result = data.get("result")
+        if not isinstance(result, dict):
+            raise DialogsApiError(
+                "get_intent response missing 'result'", step="get_intent"
+            )
+        return IntentDraft.from_api_dict(result)
+
+    async def create_intent(self, csrf: str, skill_id: str) -> IntentDraft:
+        """Create a fresh empty intent shell and return its server-assigned id.
+
+        Yandex's API uses a two-phase create: POST creates an empty intent
+        (id and ``status="NEW"`` populated by server), then PATCH carries
+        the actual content. :meth:`update_intent` covers the PATCH half;
+        :meth:`set_intents` chains both for declarative use.
+        """
+        url = (
+            f"{DIALOGS_API_BASE}/apps/{skill_id}/intents/draft"
+            f"?channel={DIALOG_CHANNEL}"
+        )
+        data = await self._post_json(url, {}, csrf=csrf, step="create_intent")
+        result = data.get("result")
+        if not isinstance(result, dict):
+            raise DialogsApiError(
+                "create_intent response missing 'result'", step="create_intent"
+            )
+        intent = IntentDraft.from_api_dict(result)
+        if intent.intent_id is None:
+            raise DialogsApiError(
+                "create_intent response missing intent id", step="create_intent"
+            )
+        return intent
+
+    async def update_intent(
+        self, csrf: str, skill_id: str, intent: IntentDraft
+    ) -> IntentDraft:
+        """PATCH an existing intent's content. Server validates grammar synchronously.
+
+        On valid grammar: returns the saved :class:`IntentDraft` with
+        ``status="NEW"``.
+
+        On invalid grammar: Yandex still returns HTTP 200 and saves the
+        intent (subsequent reads show it with the bad source), but the
+        response carries a ``validationError`` block. We surface that as
+        :class:`DialogsIntentValidationError` so callers can handle the
+        error programmatically. The previously-valid version of the
+        intent (if any) remains effective at runtime — Yandex preserves
+        the last-good source until a valid PATCH replaces it.
+        """
+        if intent.intent_id is None:
+            raise DialogsApiError(
+                "update_intent requires intent.intent_id (call create_intent first)",
+                step="update_intent",
+            )
+        url = (
+            f"{DIALOGS_API_BASE}/apps/{skill_id}/intents/{intent.intent_id}/draft"
+            f"?channel={DIALOG_CHANNEL}"
+        )
+        data = await self._patch_json(
+            url, intent.to_api_dict(), csrf=csrf, step="update_intent"
+        )
+        result = data.get("result")
+        if not isinstance(result, dict):
+            raise DialogsApiError(
+                "update_intent response missing 'result'", step="update_intent"
+            )
+        intent_raw = result.get("intent")
+        if not isinstance(intent_raw, dict):
+            raise DialogsApiError(
+                "update_intent response missing 'result.intent'", step="update_intent"
+            )
+        validation_error = result.get("validationError")
+        if isinstance(validation_error, dict):
+            bounds = validation_error.get("errorBounds")
+            char_count = char_offset = line_number = -1
+            if isinstance(bounds, dict):
+                char_count = int(bounds.get("charCount", -1) or -1)
+                char_offset = int(bounds.get("charOffset", -1) or -1)
+                line_number = int(bounds.get("lineNumber", -1) or -1)
+            raise DialogsIntentValidationError(
+                str(validation_error.get("text") or "Grammar validation failed"),
+                step="update_intent",
+                error_code=str(validation_error.get("errorCode") or "VALIDATION_ERROR"),
+                char_count=char_count,
+                char_offset=char_offset,
+                line_number=line_number,
+                intent_id=intent.intent_id,
+                form_name=intent.form_name,
+            )
+        return IntentDraft.from_api_dict(intent_raw)
+
+    async def delete_intent(self, csrf: str, skill_id: str, intent_id: str) -> None:
+        """Delete a custom intent.
+
+        DELETE on this endpoint omits the ``?channel`` query parameter —
+        the only intent endpoint to do so (verified via Playwright probe
+        2026-05-07).
+        """
+        url = f"{DIALOGS_API_BASE}/apps/{skill_id}/intents/{intent_id}/draft"
+        headers = {"x-csrf-token": csrf}
+        async with self._session.delete(url, headers=headers) as resp:
+            body = await resp.text()
+            if resp.status not in (200, 204):
+                raise parse_error_body(
+                    body, http_status=resp.status, step="delete_intent"
+                )
+
+    async def set_intents(
+        self,
+        csrf: str,
+        skill_id: str,
+        intents: list[IntentDraft],
+        *,
+        delete_missing: bool = True,
+    ) -> list[IntentDraft]:
+        """Idempotent declarative setter for a skill's custom intents.
+
+        Diffs ``intents`` against the live state (matched by ``form_name``)
+        and issues the minimum PATCH/POST/DELETE sequence. Returns the
+        post-sync list of intents (intent_id populated, status from server).
+
+        Behaviour:
+
+        * Existing intents (matched by ``form_name``) are PATCHed when their
+          definition differs from the local one; otherwise skipped.
+        * New intents (no matching ``form_name`` on the server) are
+          created via POST + immediately PATCHed.
+        * Server intents whose ``form_name`` is missing from the input
+          list are deleted when ``delete_missing=True`` (the default —
+          matches the declarative-config use case where the input is
+          authoritative). Pass ``delete_missing=False`` to leave them
+          alone (additive merge).
+
+        Raises :class:`DialogsIntentValidationError` on the FIRST invalid
+        grammar encountered — partial progress (already-PATCHed intents)
+        remains on the server. Caller can re-invoke after fixing the
+        offending grammar; the operation is fully idempotent.
+        """
+        existing = await self.list_intents(csrf, skill_id)
+        existing_by_form = {ent.form_name: ent for ent in existing if ent.form_name}
+
+        out: list[IntentDraft] = []
+        seen_form_names: set[str] = set()
+        for desired in intents:
+            seen_form_names.add(desired.form_name)
+            current = existing_by_form.get(desired.form_name)
+            if current is None:
+                created = await self.create_intent(csrf, skill_id)
+                merged = dataclasses.replace(desired, intent_id=created.intent_id)
+                out.append(await self.update_intent(csrf, skill_id, merged))
+                continue
+            # Existing — PATCH only if anything user-controllable differs.
+            merged = dataclasses.replace(desired, intent_id=current.intent_id)
+            if (
+                merged.human_readable_name == current.human_readable_name
+                and merged.source_text == current.source_text
+                and merged.positive_tests == current.positive_tests
+                and merged.negative_tests == current.negative_tests
+                and merged.is_activation == current.is_activation
+            ):
+                out.append(current)
+                continue
+            out.append(await self.update_intent(csrf, skill_id, merged))
+
+        if delete_missing:
+            for stale in existing:
+                if stale.intent_id and stale.form_name not in seen_form_names:
+                    await self.delete_intent(csrf, skill_id, stale.intent_id)
+
+        return out
 
     # -----------------------------------------------------------------------
     # Internal helpers
@@ -734,6 +1022,7 @@ async def auto_create_skill(
     activation_phrases: list[str] | None = None,
     category: str | None = None,
     voice: str | None = None,
+    intents: list[IntentDraft] | None = None,
     progress_cb: Callable[[SkillCreationArtifacts], Awaitable[None]] | None = None,
     creator_factory: Callable[[aiohttp.ClientSession], DialogsSkillCreator] | None = None,
     developer_name: str = "Skill creator",
@@ -815,6 +1104,7 @@ async def auto_create_skill(
                     activation_phrases=activation_phrases,
                     category=category,
                     voice=voice,
+                    intents=intents,
                     developer_name=developer_name,
                     progress_cb=track,
                 )
@@ -885,6 +1175,7 @@ async def _execute_pipeline(
     activation_phrases: list[str] | None,
     category: str | None,
     voice: str | None,
+    intents: list[IntentDraft] | None,
     developer_name: str,
     progress_cb: Callable[[SkillCreationArtifacts], Awaitable[None]] | None,
 ) -> SkillCreationArtifacts:
@@ -945,6 +1236,15 @@ async def _execute_pipeline(
             artifacts=artifacts,
             progress_cb=progress_cb,
         )
+    # Custom intents (aliceSkill only) — sync between draft update / OAuth attach
+    # and deploy. No-op when intents=None or channel=smartHome.
+    artifacts = await _step_set_intents(
+        creator=creator,
+        csrf=csrf,
+        artifacts=artifacts,
+        channel=channel,
+        intents=intents,
+    )
     artifacts = await _step_checkpoint_deploy_requested(
         artifacts=artifacts,
         progress_cb=progress_cb,
@@ -1143,6 +1443,42 @@ async def _step_checkpoint_deploy_requested(
     return artifacts
 
 
+async def _step_set_intents(
+    *,
+    creator: DialogsSkillCreator,
+    csrf: str,
+    artifacts: SkillCreationArtifacts,
+    channel: Channel,
+    intents: list[IntentDraft] | None,
+) -> SkillCreationArtifacts:
+    """Sync custom intents on the skill. No-op when intents are not applicable.
+
+    Custom intents are an ``aliceSkill``-only feature, so the step short-circuits
+    on ``smartHome``. ``intents=None`` means "leave whatever's there alone";
+    ``intents=[]`` means "delete everything custom" (declarative empty state).
+
+    Doesn't transition the state machine — runs between ``DRAFT_UPDATED`` /
+    ``OAUTH_ATTACHED`` and ``DEPLOY_REQUESTED`` as a side-effecting sync, and
+    relies on :meth:`DialogsSkillCreator.set_intents`' idempotency for retries.
+    """
+    if channel != DIALOG_CHANNEL or intents is None:
+        return artifacts
+    if artifacts.skill_id is None:
+        return artifacts
+    if artifacts.state not in (
+        SkillCreationState.DRAFT_UPDATED,
+        SkillCreationState.OAUTH_ATTACHED,
+    ):
+        return artifacts
+    _LOGGER.info(
+        "auto-skill: syncing %d custom intent(s) on skill %s",
+        len(intents),
+        artifacts.skill_id,
+    )
+    await creator.set_intents(csrf, artifacts.skill_id, intents)
+    return artifacts
+
+
 async def _step_request_deploy(
     *,
     creator: DialogsSkillCreator,
@@ -1191,6 +1527,7 @@ async def auto_update_skill(
     activation_phrases: list[str] | None = None,
     category: str | None = None,
     voice: str | None = None,
+    intents: list[IntentDraft] | None = None,
     progress_cb: Callable[[SkillCreationArtifacts], Awaitable[None]] | None = None,
     creator_factory: Callable[[aiohttp.ClientSession], DialogsSkillCreator] | None = None,
     developer_name: str = "Skill creator",
@@ -1219,6 +1556,11 @@ async def auto_update_skill(
         activation_phrases: Activation phrases (``aliceSkill`` only).
         category: Skill category (``aliceSkill`` only).
         voice: TTS voice (``aliceSkill`` only).
+        intents: Declarative list of custom intents to sync after the
+            draft update (``aliceSkill`` only). ``None`` leaves whatever
+            is on the server alone; ``[]`` deletes all custom intents.
+            Idempotent: matched against the server state by ``form_name``,
+            only diffs are PATCHed.
         progress_cb: Awaitable called after each state transition.
         creator_factory: Override for the low-level client (used in tests).
         developer_name: Developer display name embedded in the draft.
@@ -1262,6 +1604,15 @@ async def auto_update_skill(
                 )
 
             await creator.update_draft(csrf, skill_id, draft)
+            # Custom intents sync (aliceSkill only). set_intents is idempotent
+            # against the live state, so re-runs are cheap.
+            if channel == DIALOG_CHANNEL and intents is not None:
+                _LOGGER.info(
+                    "auto-skill: syncing %d custom intent(s) on skill %s",
+                    len(intents),
+                    skill_id,
+                )
+                await creator.set_intents(csrf, skill_id, intents)
             await creator.request_deploy(csrf, skill_id)
             _LOGGER.info(
                 "auto-skill: skill %r updated to name=%r and re-deployed (channel=%s)",

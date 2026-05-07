@@ -786,6 +786,141 @@ risk-flags и снимает claim «pioneer» на чуть более твёр
   7 покрыто, 11 кандидатов на расширение.
 - 2026-05-06: Phase 4 завершена — приоритизированный backlog (P0-P3),
   концептуальная карта модуля, quick-wins для 1.1.0-rc1.
+- 2026-05-07: Phase 5 — Playwright-probe NLU-интентов (раздел 7 ниже).
+
+---
+
+## 7. Phase 5 — NLU-интенты (Playwright-probe 2026-05-07)
+
+**Цель:** найти точные endpoints + payload-shape для управления custom-интентами
+(grammar DSL Yandex Dialogs) программно. Раньше предполагалось, что интенты
+лежат внутри `/draft/update` payload как поле `grammar` / `nluSettings`. Probe
+показал — это **отдельный API**, ровно 5 endpoints, индивидуальные интенты
+не часть main draft.
+
+### 7.1. Endpoints
+
+| # | Method | URL | Channel param | Описание |
+|---|---|---|---|---|
+| 1 | GET | `/developer/app-store-api/apps/{id}/intents/drafts?channel=aliceSkill` | required | Список черновиков интентов навыка |
+| 2 | GET | `/developer/app-store-api/apps/{id}/intents/drafts/{intent_id}?channel=aliceSkill` | required | Один черновик интента |
+| 3 | POST | `/developer/app-store-api/apps/{id}/intents/draft?channel=aliceSkill` | required | Создание нового интента (UUID генерится сервером) |
+| 4 | PATCH | `/developer/app-store-api/apps/{id}/intents/{intent_id}/draft?channel=aliceSkill` | required | Обновление интента |
+| 5 | DELETE | `/developer/app-store-api/apps/{id}/intents/{intent_id}/draft` | **NOT used** | Удаление интента |
+
+**Внимание на разницу URL:**
+- Список и GET одного: `/intents/drafts` (множественное число)
+- POST/PATCH/DELETE: `/intents/[{id}/]draft` (единственное число)
+- DELETE — единственный endpoint без `?channel` параметра
+
+### 7.2. Payload-shape
+
+**Все CRUD-методы** работают с этой моделью:
+
+```json
+{
+    "id": "c5245aef-0fe0-4a9f-bbde-b12364f623d4",
+    "humanReadableName": "test_probe_intent",
+    "formName": "test.probe",
+    "sourceText": "",
+    "positiveTests": "",
+    "negativeTests": "",
+    "isActivation": false,
+    "status": "NEW"
+}
+```
+
+| Поле | Тип | Назначение | Кто пишет |
+|---|---|---|---|
+| `id` | string (UUID) | Уникальный идентификатор | server (на create), client (на update) |
+| `humanReadableName` | string | Имя для UI дев-консоли | client |
+| `formName` | string | Идентификатор интента в коде грамматики (например, `play.specific`) | client |
+| `sourceText` | string | Исходник грамматики DSL | client |
+| `positiveTests` | string | Тестовые фразы (одна на строку) | client |
+| `negativeTests` | string | Анти-тесты | client |
+| `isActivation` | bool | Маркер активирующего интента (TBD) | client |
+| `status` | enum | `NEW` / `INVALID_GRAMMAR` / другие | server |
+
+### 7.3. POST (create) — пустой запрос → shell-интент
+
+POST с пустым телом `{}` создаёт shell-интент:
+```json
+{
+    "result": {
+        "id": "c5245aef-...",
+        "humanReadableName": "",
+        "status": "NEW",
+        "isActivation": false,
+        "formName": "",
+        "sourceText": "",
+        "positiveTests": "",
+        "negativeTests": ""
+    }
+}
+```
+
+UUID генерится сервером, нужен для последующего PATCH. Паттерн «two-phase
+create»: пустой POST → PATCH с реальными данными.
+
+### 7.4. PATCH — синхронная валидация грамматики
+
+Запрос — полный объект с полями выше. Ответ при невалидной грамматике
+(HTTP 200, ошибка внутри payload):
+
+```json
+{
+    "result": {
+        "intent": {
+            "id": "...",
+            "humanReadableName": "test_probe_intent",
+            "status": "INVALID_GRAMMAR",
+            "isActivation": false,
+            "formName": "test.probe",
+            "sourceText": "",
+            "positiveTests": "",
+            "negativeTests": ""
+        },
+        "validationError": {
+            "errorCode": "VALIDATION_ERROR",
+            "errorBounds": {
+                "charCount": 52,
+                "charOffset": -4,
+                "lineNumber": -1
+            },
+            "text": "Неизвестный элемент \"root\""
+        }
+    }
+}
+```
+
+**Важно:**
+- HTTP 200 даже при невалидной грамматике — статус ошибки внутри payload.
+- `validationError` присутствует только при ошибке; на успехе обёртка `{result: {intent: {...}}}` без него.
+- `errorBounds` — позиция ошибки в `sourceText` для UI-подсветки.
+
+### 7.5. Архитектурные импликации для библиотеки
+
+1. **Интенты — отдельный жизненный цикл от main draft.** НЕ нужно «два цикла модерации» (как опасались в плане ма-провайдера). Можно создавать/обновлять интенты ДО `request_deploy` — они уйдут в одну модерацию вместе с draft.
+
+2. **Создание интента — два запроса.** POST (создаёт shell с UUID) → PATCH (заполняет содержимое). Библиотека должна инкапсулировать это в одну операцию `create_intent(...)`.
+
+3. **Идемпотентность через `formName`.** Серверный `id` рандомен на каждый POST, поэтому декларативный API (`set_intents([...])`) должен матчить существующие интенты по `formName` — единственная сторона уникальности под контролем разработчика.
+
+4. **Diff-стратегия для idempotent `set_intents`:**
+   - `list_intents()` → текущее состояние.
+   - Для каждого желаемого интента: если `formName` существует — PATCH, иначе POST+PATCH.
+   - Удалить интенты, чьего `formName` нет в desired set.
+
+5. **Валидация — server-side, но синхронная.** Можно вернуть caller-у `IntentValidationError` из PATCH-результата без отдельного `validate` endpoint.
+
+6. **Заголовки CSRF и cookies** — те же, что у других endpoints (используем существующий механизм `_patch_json` etc.).
+
+### 7.6. Не охвачено probe-ом (TODO)
+
+- Endpoint(ы) для **сущностей** (`entity Player: values: ...`) — на странице Интенты есть Monaco-редактор «Сущности», но мы не успели сохранить там что-то и поймать сетевой запрос. Вероятная схема — `/apps/{id}/custom-entities/draft` или похожая.
+- `isActivation: true` — назначение поля. Гипотеза: интент-маркер для активационных фраз, заменяющий entries в `activationPhrases`.
+- Endpoint списка всех опубликованных (не draft) интентов: `/intents` (без `/drafts`)? — UI его не дёргал.
+- Запрос `/intents/{id}/test` — кнопка «Протестировать» в UI; стоит probe-нуть отдельно для validation API.
 
 ---
 
