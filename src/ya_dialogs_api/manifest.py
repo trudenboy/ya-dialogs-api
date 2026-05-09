@@ -193,12 +193,8 @@ def parse_manifest(raw: Mapping[str, Any]) -> SkillManifest:
         intents.append(
             ManifestIntent(
                 form_name=form_name,
-                human_readable_name=_require_str(
-                    item, "human_readable_name", index, default=""
-                ),
-                is_activation=_require_bool(
-                    item, "is_activation", index, default=False
-                ),
+                human_readable_name=_require_str(item, "human_readable_name", index, default=""),
+                is_activation=_require_bool(item, "is_activation", index, default=False),
                 positive_tests=_strip_block(
                     _require_str(item, "positive_tests", index, default="")
                 ),
@@ -252,8 +248,7 @@ def _require_str(
     value = item[key]
     if not isinstance(value, str):
         raise SkillManifestError(
-            f"manifest: intents[{index}].{key} must be a string, "
-            f"got {type(value).__name__}",
+            f"manifest: intents[{index}].{key} must be a string, got {type(value).__name__}",
         )
     return value
 
@@ -277,8 +272,7 @@ def _require_bool(
     value = item[key]
     if not isinstance(value, bool):
         raise SkillManifestError(
-            f"manifest: intents[{index}].{key} must be a boolean, "
-            f"got {type(value).__name__}",
+            f"manifest: intents[{index}].{key} must be a boolean, got {type(value).__name__}",
         )
     return value
 
