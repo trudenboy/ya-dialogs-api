@@ -923,18 +923,18 @@ class DialogsSkillCreator:
             # "Granet" marker in the message.
             if resp.status == 400 and "Granet" in body:
                 _LOGGER.debug(
-                    "set_entities validation failure: skill=%s body=%r request=%r",
+                    "set_entities_source validation failure: skill=%s body=%r request=%r",
                     skill_id,
                     body,
                     source_text,
                 )
                 raise DialogsEntitiesValidationError(
                     "Granet grammar validation error in custom entities",
-                    step="set_entities",
+                    step="set_entities_source",
                     http_status=400,
                     yandex_error=body,
                 )
-            raise parse_error_body(body, http_status=resp.status, step="set_entities")
+            raise parse_error_body(body, http_status=resp.status, step="set_entities_source")
 
     async def set_entities(
         self,
@@ -1337,6 +1337,22 @@ async def auto_create_skill(
     - ``progress_cb`` is invoked after each successful step with the updated
       artifacts; persist them and on the next call pass the saved artifacts
       back in so the pipeline resumes from the latest completed step.
+
+    Custom NLU parameters (``aliceSkill`` only — silently ignored on
+    ``smartHome``):
+
+    - ``intents`` — declarative list of custom intents to sync after the
+      draft update. ``None`` (default) leaves whatever is on the server
+      alone; ``[]`` deletes all custom intents (declarative empty
+      state). Idempotent: matched against the server state by
+      ``form_name``, only diffs are PATCHed (see
+      :meth:`DialogsSkillCreator.set_intents`).
+    - ``entities`` — declarative list of custom entities to sync.
+      ``None`` (default) leaves the server-side ``customEntities``
+      ``sourceText`` alone; ``[]`` clears all custom entities.
+      Synced **before** ``intents`` so intent grammars referencing
+      entity types pass Granet validation. Single-shot replace via
+      PUT (see :meth:`DialogsSkillCreator.set_entities`).
 
     Authentication is the caller's responsibility: ``authenticator`` is a
     no-arg async-context-manager factory that yields an
