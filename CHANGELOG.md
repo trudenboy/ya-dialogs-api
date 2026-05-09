@@ -6,7 +6,62 @@ All notable changes to this project will be documented in this file. The format 
 
 ## [Unreleased]
 
-## [2.2.0] — 2026-05-09
+## [2.3.0] — 2026-05-09
+
+### Added
+
+- **`ya_dialogs_api.manifest` — declarative skill description format.**
+  A new TOML-based manifest schema lets clients ship a Yandex skill's
+  intents and custom entities as pure data instead of hard-coded
+  Python. Each intent's ``grammar`` field carries the Granet
+  ``sourceText`` byte-for-byte, so it is copy-paste-compatible with
+  the dev-console editor at
+  ``https://dialogs.yandex.ru/developer/skills/<id>/draft/settings/intents``.
+  Field names mirror Yandex API names in snake_case (``form_name`` ↔
+  ``formName``, ``human_readable_name`` ↔ ``humanReadableName``, etc.)
+  so the cognitive load matches the dev-console UI.
+
+  Public API:
+
+  - ``SkillManifest`` / ``ManifestIntent`` / ``ManifestEntities`` —
+    immutable parsed view.
+  - ``parse_manifest(raw_dict)`` / ``parse_manifest_text(toml_str)`` —
+    loaders with structural validation (schema_version,
+    duplicate-form-name detection, required field checks).
+  - ``SkillManifest.to_intent_drafts()`` /
+    ``SkillManifest.to_entity_drafts()`` — feed the result of
+    ``set_intents`` / ``set_entities`` directly.
+  - ``intent_to_draft(intent)`` — single-intent conversion helper.
+  - ``entities_to_drafts(text)`` — Granet ``customEntities`` DSL
+    parser; round-trips with ``EntityDraft.to_dsl()``.
+  - ``SkillManifestError`` — typed validation error with concrete
+    field path in the message.
+  - ``SUPPORTED_SCHEMA_VERSION`` — current schema version (``1``);
+    loader rejects newer ``schema_version`` so a forward-compat
+    user override doesn't get silently parsed.
+
+  The module is intentionally agnostic about runtime semantics
+  (i.e. how a client maps a matched intent to its own command
+  dataclass). That belongs to the calling application.
+
+- **`ya_dialogs_api.nlu` — typed accessors over the webhook payload.**
+  Encapsulates the *shape* of ``request.nlu.intents.<form_name>``:
+
+  - ``IntentMatch(form_name, payload)`` — one matched intent with
+    typed slot accessors: ``slot_int(name) -> int | None``,
+    ``slot_str(name) -> str | None``, ``slot_value(name) -> Any``,
+    ``raw_slot(name) -> Mapping | None``, ``has_slot(name) -> bool``.
+    Numeric accessor coerces ``int`` and ``float`` (Yandex sends
+    either depending on the spoken number); booleans are explicitly
+    rejected because ``isinstance(True, int)`` is true.
+  - ``iter_intent_matches(nlu_intents)`` — yield one ``IntentMatch``
+    per ``form_name`` in dict insertion order. Tolerates ``None`` /
+    non-mapping inputs without raising.
+
+  This is the layer that absorbs Yandex format changes — if Yandex
+  renames ``slots[name].value`` or moves it under a different key,
+  only this module changes; downstream providers keep the same
+  calling pattern.
 
 ### Added
 
