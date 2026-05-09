@@ -63,6 +63,18 @@ from .api_client import (
     build_smart_home_draft_payload,
     load_default_logo_bytes,
 )
+from .manifest import (
+    SUPPORTED_SCHEMA_VERSION,
+    ManifestEntities,
+    ManifestIntent,
+    SkillManifest,
+    SkillManifestError,
+    entities_to_drafts,
+    intent_to_draft,
+    parse_manifest,
+    parse_manifest_text,
+)
+from .nlu import IntentMatch, iter_intent_matches
 from .state import (
     SkillCreationArtifacts,
     SkillCreationState,
@@ -78,6 +90,7 @@ __all__ = [
     "DIALOGS_DEV_HTML_URL",
     "DIALOG_CHANNEL",
     "SMART_HOME_CHANNEL",
+    "SUPPORTED_SCHEMA_VERSION",
     "AuthenticatorCM",
     "Channel",
     "DialogsApiError",
@@ -92,9 +105,14 @@ __all__ = [
     "EntityDraft",
     "EntityValue",
     "IntentDraft",
+    "IntentMatch",
+    "ManifestEntities",
+    "ManifestIntent",
     "SecretStr",
     "SkillCreationArtifacts",
     "SkillCreationState",
+    "SkillManifest",
+    "SkillManifestError",
     "SlotDeclaration",
     "auto_create_skill",
     "auto_update_skill",
@@ -102,6 +120,11 @@ __all__ = [
     "build_oauth_app_payload",
     "build_smart_home_draft_payload",
     "dump_artifacts",
+    "entities_to_drafts",
+    "intent_to_draft",
+    "iter_intent_matches",
     "load_artifacts",
     "load_default_logo_bytes",
+    "parse_manifest",
+    "parse_manifest_text",
 ]
