@@ -67,6 +67,9 @@ from .manifest import (
     SUPPORTED_SCHEMA_VERSION,
     ManifestEntities,
     ManifestIntent,
+    ManifestMapping,
+    ManifestMultiplyWhen,
+    ManifestRuntime,
     SkillManifest,
     SkillManifestError,
     entities_to_drafts,
@@ -75,6 +78,7 @@ from .manifest import (
     parse_manifest_text,
 )
 from .nlu import IntentMatch, iter_intent_matches
+from .runtime import RuntimeMappingError, apply_runtime_mapping
 from .state import (
     SkillCreationArtifacts,
     SkillCreationState,
@@ -108,12 +112,17 @@ __all__ = [
     "IntentMatch",
     "ManifestEntities",
     "ManifestIntent",
+    "ManifestMapping",
+    "ManifestMultiplyWhen",
+    "ManifestRuntime",
+    "RuntimeMappingError",
     "SecretStr",
     "SkillCreationArtifacts",
     "SkillCreationState",
     "SkillManifest",
     "SkillManifestError",
     "SlotDeclaration",
+    "apply_runtime_mapping",
     "auto_create_skill",
     "auto_update_skill",
     "build_dialog_draft_payload",

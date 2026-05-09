@@ -14,6 +14,9 @@ from ya_dialogs_api import (
     IntentDraft,
     ManifestEntities,
     ManifestIntent,
+    ManifestMapping,
+    ManifestMultiplyWhen,
+    ManifestRuntime,
     SkillManifest,
     SkillManifestError,
     entities_to_drafts,
@@ -213,6 +216,216 @@ class TestParseManifestText:
     def test_invalid_toml_raises(self) -> None:
         with pytest.raises(SkillManifestError, match="malformed"):
             parse_manifest_text("not = a = valid = toml = ===")
+
+
+class TestRuntimeParsing:
+    """``parse_manifest`` reads the optional ``runtime`` block."""
+
+    def test_intent_without_runtime_block(self) -> None:
+        raw = _toml_to_dict(
+            """
+            schema_version = 1
+            [entities]
+            text = ""
+            [[intents]]
+            form_name = "control.x"
+            grammar = "root: x"
+            """
+        )
+        manifest = parse_manifest(raw)
+        assert manifest.intents[0].runtime is None
+
+    def test_no_mapping_runtime(self) -> None:
+        raw = _toml_to_dict(
+            """
+            schema_version = 1
+            [entities]
+            text = ""
+            [[intents]]
+            form_name = "control.pause"
+            grammar = "root: x"
+            [intents.runtime]
+            kind = "control"
+            action = "pause"
+            """
+        )
+        intent = parse_manifest(raw).intents[0]
+        assert intent.runtime == ManifestRuntime(kind="control", action="pause")
+
+    def test_single_mapping_with_clamp(self) -> None:
+        raw = _toml_to_dict(
+            """
+            schema_version = 1
+            [entities]
+            text = ""
+            [[intents]]
+            form_name = "control.volume_set"
+            grammar = "root: x"
+            [intents.runtime]
+            kind = "control"
+            action = "volume_set"
+            [[intents.runtime.mapping]]
+            field = "value"
+            from_slot = "level"
+            transform = "clamp"
+            min = 0
+            max = 100
+            """
+        )
+        runtime = parse_manifest(raw).intents[0].runtime
+        assert runtime is not None
+        assert runtime.mapping == (
+            ManifestMapping(field="value", from_slot="level", transform="clamp", min=0, max=100),
+        )
+
+    def test_mapping_with_multiply_when_and_cap(self) -> None:
+        raw = _toml_to_dict(
+            """
+            schema_version = 1
+            [entities]
+            text = ""
+            [[intents]]
+            form_name = "control.seek_forward"
+            grammar = "root: x"
+            [intents.runtime]
+            kind = "control"
+            action = "seek_forward"
+            [[intents.runtime.mapping]]
+            field = "value"
+            from_slot = "amount"
+            slot_type = "int"
+            reject_if_below = 1
+            cap = 86400
+            [[intents.runtime.mapping.multiply_when]]
+            slot = "unit"
+            equals = "minutes"
+            factor = 60
+            """
+        )
+        runtime = parse_manifest(raw).intents[0].runtime
+        assert runtime is not None
+        assert len(runtime.mapping) == 1
+        m = runtime.mapping[0]
+        assert m.from_slot == "amount"
+        assert m.cap == 86400
+        assert m.reject_if_below == 1
+        assert m.multiply_when == (ManifestMultiplyWhen(slot="unit", equals="minutes", factor=60),)
+
+    def test_invalid_transform_raises(self) -> None:
+        raw = _toml_to_dict(
+            """
+            schema_version = 1
+            [entities]
+            text = ""
+            [[intents]]
+            form_name = "control.x"
+            grammar = "root: x"
+            [intents.runtime]
+            kind = "control"
+            action = "x"
+            [[intents.runtime.mapping]]
+            field = "value"
+            from_slot = "n"
+            transform = "weird_transform"
+            """
+        )
+        with pytest.raises(SkillManifestError, match="transform must be one of"):
+            parse_manifest(raw)
+
+    def test_invalid_slot_type_raises(self) -> None:
+        raw = _toml_to_dict(
+            """
+            schema_version = 1
+            [entities]
+            text = ""
+            [[intents]]
+            form_name = "control.x"
+            grammar = "root: x"
+            [intents.runtime]
+            kind = "control"
+            action = "x"
+            [[intents.runtime.mapping]]
+            field = "value"
+            from_slot = "n"
+            slot_type = "float"
+            """
+        )
+        with pytest.raises(SkillManifestError, match="slot_type must be one of"):
+            parse_manifest(raw)
+
+    def test_invalid_sign_raises(self) -> None:
+        raw = _toml_to_dict(
+            """
+            schema_version = 1
+            [entities]
+            text = ""
+            [[intents]]
+            form_name = "control.x"
+            grammar = "root: x"
+            [intents.runtime]
+            kind = "control"
+            action = "x"
+            [[intents.runtime.mapping]]
+            field = "value"
+            from_slot = "n"
+            sign = "double_negative"
+            """
+        )
+        with pytest.raises(SkillManifestError, match="sign must be one of"):
+            parse_manifest(raw)
+
+    def test_min_with_string_value_raises(self) -> None:
+        raw = _toml_to_dict(
+            """
+            schema_version = 1
+            [entities]
+            text = ""
+            [[intents]]
+            form_name = "control.x"
+            grammar = "root: x"
+            [intents.runtime]
+            kind = "control"
+            action = "x"
+            [[intents.runtime.mapping]]
+            field = "value"
+            from_slot = "n"
+            min = "zero"
+            """
+        )
+        with pytest.raises(SkillManifestError, match="min must be an integer"):
+            parse_manifest(raw)
+
+    def test_runtime_kind_required(self) -> None:
+        raw = _toml_to_dict(
+            """
+            schema_version = 1
+            [entities]
+            text = ""
+            [[intents]]
+            form_name = "control.x"
+            grammar = "root: x"
+            [intents.runtime]
+            action = "x"
+            """
+        )
+        with pytest.raises(SkillManifestError, match=r"runtime\.kind"):
+            parse_manifest(raw)
+
+    def test_runtime_action_required(self) -> None:
+        raw = _toml_to_dict(
+            """
+            schema_version = 1
+            [entities]
+            text = ""
+            [[intents]]
+            form_name = "control.x"
+            grammar = "root: x"
+            [intents.runtime]
+            kind = "control"
+            """
+        )
+        with pytest.raises(SkillManifestError, match=r"runtime\.action"):
+            parse_manifest(raw)
 
 
 class TestEntitiesToDrafts:
