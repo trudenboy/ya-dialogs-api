@@ -1290,28 +1290,72 @@ class TestIntentCRUD:
     """list / get / create / update / delete / set_intents on DialogsSkillCreator."""
 
     @pytest.mark.asyncio
-    async def test_list_intents_returns_decoded_drafts(self) -> None:
-        """GET /apps/{id}/intents/drafts decodes to list[IntentDraft]."""
+    async def test_list_intents_fans_out_for_full_payload(self) -> None:
+        """list_intents fetches each id's full draft so form_name / source survive.
+
+        Yandex's bulk listing endpoint omits ``formName`` and ``sourceText``;
+        only ``id`` / ``humanReadableName`` / ``status`` / ``isActivation``
+        come back. ``set_intents`` matches existing entries by ``form_name``
+        so the listing alone is unusable for diff/upsert. ``list_intents``
+        therefore fans out per-id GETs in parallel and returns IntentDrafts
+        carrying the full payload.
+        """
         session = _make_session()
-        _install_ctx(
-            session.get,
-            _mock_response(
-                status=200,
-                body_json={
-                    "result": [
-                        {"id": "u1", "formName": "play.specific", "sourceText": "root: x"},
-                        {"id": "u2", "formName": "control.pause"},
-                    ]
-                },
-            ),
+
+        def _ctx(resp: AsyncMock) -> MagicMock:
+            ctx = MagicMock()
+            ctx.__aenter__ = AsyncMock(return_value=resp)
+            ctx.__aexit__ = AsyncMock(return_value=False)
+            return ctx
+
+        listing_resp = _mock_response(
+            status=200,
+            body_json={
+                "result": [
+                    {"id": "u1", "humanReadableName": "Play"},
+                    {"id": "u2", "humanReadableName": "Pause"},
+                ]
+            },
         )
+        full_u1 = _mock_response(
+            status=200,
+            body_json={
+                "result": {
+                    "id": "u1",
+                    "formName": "play.specific",
+                    "humanReadableName": "Play",
+                    "sourceText": "root: x",
+                }
+            },
+        )
+        full_u2 = _mock_response(
+            status=200,
+            body_json={
+                "result": {"id": "u2", "formName": "control.pause", "humanReadableName": "Pause"}
+            },
+        )
+        session.get.side_effect = [_ctx(listing_resp), _ctx(full_u1), _ctx(full_u2)]
+
         creator = DialogsSkillCreator(session, channel=DIALOG_CHANNEL)
         intents = await creator.list_intents("csrf", "skill-1")
         assert [i.form_name for i in intents] == ["play.specific", "control.pause"]
-        # Channel hard-coded to aliceSkill regardless of creator's channel.
-        url = session.get.call_args.args[0]
-        assert "channel=aliceSkill" in url
-        assert "/apps/skill-1/intents/drafts" in url
+        # 1 listing GET + 2 per-id GETs.
+        assert session.get.call_count == 3
+        listing_url = session.get.call_args_list[0].args[0]
+        assert "channel=aliceSkill" in listing_url
+        assert "/apps/skill-1/intents/drafts" in listing_url
+        per_id_urls = [c.args[0] for c in session.get.call_args_list[1:]]
+        assert all("/intents/drafts/u" in u for u in per_id_urls)
+
+    @pytest.mark.asyncio
+    async def test_list_intents_empty_listing_skips_fanout(self) -> None:
+        """Empty listing returns [] without firing per-id GETs."""
+        session = _make_session()
+        _install_ctx(session.get, _mock_response(status=200, body_json={"result": []}))
+        creator = DialogsSkillCreator(session, channel=DIALOG_CHANNEL)
+        intents = await creator.list_intents("csrf", "skill-1")
+        assert intents == []
+        assert session.get.call_count == 1
 
     @pytest.mark.asyncio
     async def test_get_intent_decodes_single(self) -> None:
@@ -1506,25 +1550,45 @@ class TestIntentCRUD:
         # No PATCH for control.pause (our copy is identical to server's).
         session.get = MagicMock()
         session.request = MagicMock()
-        # GET response for list_intents
+        # GET responses for list_intents:
+        # 1) bulk listing returns id + status, no formName/sourceText
+        # 2) per-id GET on drafts/{intent_id} returns full payload
         list_resp = _mock_response(
             status=200,
             body_json={
                 "result": [
                     {
                         "id": "existing-uuid",
-                        "formName": "control.pause",
                         "humanReadableName": "Pause",
-                        "sourceText": "root: пауза",
-                        "positiveTests": "",
-                        "negativeTests": "",
                         "isActivation": False,
                         "status": "NEW",
                     }
                 ]
             },
         )
-        _install_ctx(session.get, list_resp)
+        full_resp = _mock_response(
+            status=200,
+            body_json={
+                "result": {
+                    "id": "existing-uuid",
+                    "formName": "control.pause",
+                    "humanReadableName": "Pause",
+                    "sourceText": "root: пауза",
+                    "positiveTests": "",
+                    "negativeTests": "",
+                    "isActivation": False,
+                    "status": "NEW",
+                }
+            },
+        )
+
+        def _ctx(resp: AsyncMock) -> MagicMock:
+            ctx = MagicMock()
+            ctx.__aenter__ = AsyncMock(return_value=resp)
+            ctx.__aexit__ = AsyncMock(return_value=False)
+            return ctx
+
+        session.get.side_effect = [_ctx(list_resp), _ctx(full_resp)]
         # POST + PATCH chained — return values per call.
         responses = [
             # POST create → returns new shell with id
@@ -1593,23 +1657,43 @@ class TestIntentCRUD:
         session.get = MagicMock()
         session.delete = MagicMock()
         # Server has one intent; we pass empty desired → it gets deleted.
+        # list_intents fans out: bulk listing → per-id GET for full payload.
         list_resp = _mock_response(
             status=200,
             body_json={
                 "result": [
                     {
                         "id": "stale-uuid",
-                        "formName": "old.intent",
-                        "sourceText": "",
-                        "positiveTests": "",
-                        "negativeTests": "",
+                        "humanReadableName": "Old",
                         "isActivation": False,
                         "status": "NEW",
                     }
                 ]
             },
         )
-        _install_ctx(session.get, list_resp)
+        full_resp = _mock_response(
+            status=200,
+            body_json={
+                "result": {
+                    "id": "stale-uuid",
+                    "formName": "old.intent",
+                    "humanReadableName": "Old",
+                    "sourceText": "",
+                    "positiveTests": "",
+                    "negativeTests": "",
+                    "isActivation": False,
+                    "status": "NEW",
+                }
+            },
+        )
+
+        def _ctx(resp: AsyncMock) -> MagicMock:
+            ctx = MagicMock()
+            ctx.__aenter__ = AsyncMock(return_value=resp)
+            ctx.__aexit__ = AsyncMock(return_value=False)
+            return ctx
+
+        session.get.side_effect = [_ctx(list_resp), _ctx(full_resp)]
         _install_ctx(session.delete, _mock_response(status=200, body_text="{}"))
         creator = DialogsSkillCreator(session, channel=DIALOG_CHANNEL)
         result = await creator.set_intents("csrf", "skill-1", [], delete_missing=True)

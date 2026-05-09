@@ -6,6 +6,25 @@ All notable changes to this project will be documented in this file. The format 
 
 ## [Unreleased]
 
+## [2.1.2] — 2026-05-09
+
+### Fixed
+
+- **`list_intents` now returns full per-intent payload** (form_name +
+  source_text + tests). Yandex's bulk listing endpoint
+  (`GET /apps/{id}/intents/drafts`) only includes `id`,
+  `humanReadableName`, `status` and `isActivation` — `formName` and
+  `sourceText` are stripped. Since `set_intents` matches existing
+  entries by `form_name`, the listing alone left every server-side
+  intent invisible to the diff/upsert protocol: `set_intents` would
+  treat each desired entry as new, POST a fresh shell, then PATCH the
+  shell with a `formName` that another (already-formNamed) intent had
+  reserved → `DialogsApiError: Form name already exists`. `list_intents`
+  now fans out to `get_intent` per id (in parallel via `asyncio.gather`)
+  so the returned drafts carry the data the diff actually needs. The
+  rename / drift-sync flow (`auto_update_skill`) is finally idempotent
+  on a populated skill.
+
 ## [2.1.1] — 2026-05-08
 
 ### Changed

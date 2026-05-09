@@ -462,12 +462,19 @@ class DialogsSkillCreator:
     # -----------------------------------------------------------------------
 
     async def list_intents(self, csrf: str, skill_id: str) -> list[IntentDraft]:
-        """List all custom-intent drafts for the skill.
+        """List all custom-intent drafts for the skill, with full per-intent content.
 
         Channel is hard-coded to ``aliceSkill`` regardless of
         ``self._channel`` because intents only exist on the dialog
         channel — calling this on a smart-home skill returns an empty
         list at the API level.
+
+        The bulk listing endpoint returns only ``id``, ``humanReadableName``,
+        ``status`` and ``isActivation`` — ``formName`` and ``sourceText`` are
+        omitted. Since :meth:`set_intents` matches existing entries by
+        ``form_name``, this method fans out to :meth:`get_intent` for each
+        listed id (in parallel) so the returned drafts carry the full payload
+        the diff/upsert protocol needs.
         """
         url = f"{DIALOGS_API_BASE}/apps/{skill_id}/intents/drafts?channel={DIALOG_CHANNEL}"
         data = await self._get_json(url, csrf=csrf, step="list_intents")
@@ -478,7 +485,18 @@ class DialogsSkillCreator:
         items: Any = result if isinstance(result, list) else data
         if not isinstance(items, list):
             raise DialogsApiError("list_intents response missing list payload", step="list_intents")
-        return [IntentDraft.from_api_dict(item) for item in items if isinstance(item, dict)]
+        ids: list[str] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            raw_id = item.get("id")
+            if isinstance(raw_id, str) and raw_id:
+                ids.append(raw_id)
+        if not ids:
+            return []
+        return list(
+            await asyncio.gather(*(self.get_intent(csrf, skill_id, intent_id) for intent_id in ids))
+        )
 
     async def get_intent(self, csrf: str, skill_id: str, intent_id: str) -> IntentDraft:
         """Fetch a single intent draft by id."""
