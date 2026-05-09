@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from ya_dialogs_api import IntentMatch, iter_intent_matches
@@ -11,7 +13,7 @@ class TestIterIntentMatches:
     """``iter_intent_matches`` yields one IntentMatch per matched intent."""
 
     def test_yields_match_per_form_name(self) -> None:
-        nlu = {
+        nlu: dict[str, Any] = {
             "control.pause": {},
             "control.next": {"slots": {}},
         }
@@ -31,7 +33,7 @@ class TestIterIntentMatches:
         assert list(iter_intent_matches({})) == []
 
     def test_skips_invalid_form_names(self) -> None:
-        nlu = {
+        nlu: dict[str, Any] = {
             "": {},  # empty key
             "control.pause": {},
         }
@@ -40,8 +42,8 @@ class TestIterIntentMatches:
 
     def test_non_mapping_payload_wrapped_as_empty(self) -> None:
         """A weird payload (string/list) is wrapped — slot accessors return None."""
-        nlu = {"control.pause": "garbage"}
-        matches = list(iter_intent_matches(nlu))  # type: ignore[arg-type]
+        nlu: dict[str, Any] = {"control.pause": "garbage"}
+        matches = list(iter_intent_matches(nlu))
         assert len(matches) == 1
         assert matches[0].slot_int("level") is None
 
