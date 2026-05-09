@@ -42,6 +42,7 @@ from .errors import (
     DialogsAuthError,
     DialogsCsrfError,
     DialogsDuplicateSkillError,
+    DialogsEntitiesValidationError,
     DialogsIntentValidationError,
     DialogsSkillNotFoundError,
     DialogsValidationError,
@@ -77,11 +78,15 @@ __all__ = [
     "DialogsAuthError",
     "DialogsCsrfError",
     "DialogsDuplicateSkillError",
+    "DialogsEntitiesValidationError",
     "DialogsIntentValidationError",
     "DialogsSkillCreator",
     "DialogsSkillNotFoundError",
     "DialogsValidationError",
+    "EntityDraft",
+    "EntityValue",
     "IntentDraft",
+    "SlotDeclaration",
     "auto_create_skill",
     "auto_update_skill",
     "build_dialog_draft_payload",
@@ -113,6 +118,58 @@ _MAX_HTML_RESPONSE_BYTES = 2 * 1024 * 1024  # 2 MiB
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
+class SlotDeclaration:
+    """Typed slot declaration attached to an :class:`IntentDraft`.
+
+    Slots are the structured parameters that Yandex extracts from a
+    matched utterance and surfaces under
+    ``request.nlu.intents.<form_name>.slots.<name>`` to the webhook.
+    Declaring them programmatically lets the library compose the
+    corresponding ``slots:`` block of DSL into the intent's
+    ``sourceText`` automatically — see
+    :attr:`IntentDraft.rendered_source_text` — so callers can keep the
+    structured definition and the grammar in lockstep.
+
+    :param name: Slot key (lowercase identifier, e.g. ``"level"``).
+    :param type: Slot type: a built-in (``"YANDEX.NUMBER"``,
+        ``"YANDEX.DATETIME"``, ``"YANDEX.STRING"``, ``"YANDEX.GEO"``,
+        ``"YANDEX.FIO"``) or the ``name`` of a custom entity declared
+        on the same skill.
+    :param source: Grammar non-terminal capturing the value, written
+        with its leading ``$`` (e.g. ``"$Level"``). Must reference a
+        non-terminal defined elsewhere in :attr:`IntentDraft.source_text`.
+    """
+
+    name: str
+    type: str
+    source: str
+
+
+# Detect a pre-existing ``slots:`` block in a hand-rolled DSL, so
+# rendering doesn't double up. Anchored to the start of a line, with
+# optional trailing whitespace.
+_SLOTS_BLOCK_RE = re.compile(r"^slots:\s*$", re.MULTILINE)
+
+
+def _render_slots_block(slots: tuple[SlotDeclaration, ...]) -> str:
+    """Render a tuple of :class:`SlotDeclaration` as a Yandex ``slots:`` DSL block.
+
+    Indentation matches the convention used by the dev console: four
+    spaces for slot keys, eight for ``type:`` / ``source:`` lines.
+    Empty input returns the empty string (caller short-circuits before
+    appending).
+    """
+    if not slots:
+        return ""
+    lines = ["slots:"]
+    for slot in slots:
+        lines.append(f"    {slot.name}:")
+        lines.append(f"        type: {slot.type}")
+        lines.append(f"        source: {slot.source}")
+    return "\n".join(lines)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
 class IntentDraft:
     """Single Yandex Dialogs custom-intent definition.
 
@@ -134,6 +191,14 @@ class IntentDraft:
     intent, ``INVALID_GRAMMAR`` when the most recent PATCH carried bad
     grammar (the previous valid version stays effective). Other values
     documented sparsely by Yandex; treat as opaque.
+
+    ``slots`` carries structured slot declarations; their DSL
+    representation is composed into ``sourceText`` at serialise time
+    via :attr:`rendered_source_text`. If ``source_text`` already
+    contains a ``slots:`` block (e.g. the author hand-rolled it, or the
+    intent came back from :meth:`from_api_dict`), the structured
+    declarations are silently ignored at render time so the block is
+    never duplicated.
     """
 
     form_name: str
@@ -142,12 +207,41 @@ class IntentDraft:
     positive_tests: str = ""
     negative_tests: str = ""
     is_activation: bool = False
+    slots: tuple[SlotDeclaration, ...] = ()
     intent_id: str | None = None
     status: str = "NEW"
 
+    @property
+    def rendered_source_text(self) -> str:
+        """``source_text`` with the structured slots block composed in.
+
+        Returns ``source_text`` verbatim when there are no structured
+        slots, or when ``source_text`` already contains its own
+        ``slots:`` line. Otherwise appends a generated ``slots:`` block
+        built from :attr:`slots`. The result is what
+        :meth:`to_api_dict` ships to the server, and what
+        :meth:`DialogsSkillCreator.set_intents` diffs against the
+        server-side ``sourceText``.
+        """
+        if not self.slots:
+            return self.source_text
+        if _SLOTS_BLOCK_RE.search(self.source_text):
+            return self.source_text
+        block = _render_slots_block(self.slots)
+        if not self.source_text:
+            return f"{block}\n"
+        sep = "" if self.source_text.endswith("\n") else "\n"
+        return f"{self.source_text}{sep}{block}\n"
+
     @classmethod
     def from_api_dict(cls, raw: Mapping[str, Any]) -> IntentDraft:
-        """Decode a single intent payload as returned by the API."""
+        """Decode a single intent payload as returned by the API.
+
+        The ``slots`` tuple is left empty: the rendered ``slots:`` block
+        is part of ``sourceText`` server-side, and the library treats
+        the wire form as authoritative for round-trip diffs (see
+        :meth:`DialogsSkillCreator.set_intents`).
+        """
         return cls(
             form_name=str(raw.get("formName") or ""),
             human_readable_name=str(raw.get("humanReadableName") or ""),
@@ -162,13 +256,16 @@ class IntentDraft:
     def to_api_dict(self) -> dict[str, Any]:
         """Encode for use in PATCH payloads.
 
-        ``id`` is included when known (PATCH path requires it); ``status``
-        is sent as the client-known last value but Yandex re-computes it.
+        ``sourceText`` carries :attr:`rendered_source_text` so any
+        structured :class:`SlotDeclaration` entries are materialised
+        before the payload leaves the process. ``id`` is included when
+        known (PATCH path requires it); ``status`` is sent as the
+        client-known last value but Yandex re-computes it.
         """
         payload: dict[str, Any] = {
             "humanReadableName": self.human_readable_name,
             "formName": self.form_name,
-            "sourceText": self.source_text,
+            "sourceText": self.rendered_source_text,
             "positiveTests": self.positive_tests,
             "negativeTests": self.negative_tests,
             "isActivation": self.is_activation,
@@ -177,6 +274,91 @@ class IntentDraft:
         if self.intent_id is not None:
             payload["id"] = self.intent_id
         return payload
+
+
+# ---------------------------------------------------------------------------
+# Custom entities (aliceSkill channel only)
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class EntityValue:
+    """One named value within an :class:`EntityDraft`.
+
+    ``name`` is the key surfaced to a webhook handler in
+    ``request.nlu.entities[i].value`` when an utterance matches; the
+    ``phrases`` tuple lists the alternative spoken forms that should
+    map to this value.
+
+    :param name: Lowercase identifier (no spaces).
+    :param phrases: Alternative spoken phrases that map to ``name``.
+        Rendered in DSL as ``phrase | phrase | …``.
+    """
+
+    name: str
+    phrases: tuple[str, ...]
+
+    def to_dsl(self) -> str:
+        """Render this value as two indented DSL lines.
+
+        Format::
+
+            ``        <name>:``
+            ``            <phrase> | <phrase> | …``
+
+        The 8/12-space indentation matches the convention emitted by
+        Yandex's dev-console editor and accepted by the Granet parser.
+        """
+        body = " | ".join(self.phrases)
+        return f"        {self.name}:\n            {body}"
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class EntityDraft:
+    """Single Yandex Dialogs custom entity definition.
+
+    Custom entities are reusable enums of phrases that intent grammars
+    can reference as a slot type or as a non-terminal. The dialog
+    channel (``aliceSkill``) stores them as one Granet ``sourceText``
+    blob per skill; the library's :meth:`DialogsSkillCreator.set_entities`
+    composes a list of :class:`EntityDraft` into that single blob and
+    PUTs it via the entities endpoint.
+
+    :param name: Entity identifier — also the slot ``type`` name when
+        referenced from an :class:`IntentDraft`'s
+        :class:`SlotDeclaration`.
+    :param values: Tuple of :class:`EntityValue`, one per enum entry.
+    """
+
+    name: str
+    values: tuple[EntityValue, ...]
+
+    def to_dsl(self) -> str:
+        """Render this entity as a Granet ``entity`` block.
+
+        Format::
+
+            entity <name>:
+                values:
+                    <value-block>
+                    <value-block>
+
+        Composes :meth:`EntityValue.to_dsl` for each value.
+        """
+        lines = [f"entity {self.name}:", "    values:", *(v.to_dsl() for v in self.values)]
+        return "\n".join(lines)
+
+
+def _render_entities_source(entities: tuple[EntityDraft, ...]) -> str:
+    """Render multiple entity drafts as one Granet entities ``sourceText``.
+
+    Empty input maps to an empty string — equivalent to "no custom
+    entities". The endpoint accepts that as a clear-all and returns
+    HTTP 200.
+    """
+    if not entities:
+        return ""
+    return "\n".join(entity.to_dsl() for entity in entities) + "\n"
 
 
 # ---------------------------------------------------------------------------
@@ -657,10 +839,18 @@ class DialogsSkillCreator:
                 out.append(await self.update_intent(csrf, skill_id, merged))
                 continue
             # Existing — PATCH only if anything user-controllable differs.
+            # Compare against the rendered DSL: a desired intent built
+            # from structured ``slots`` carries the slot block in
+            # ``rendered_source_text``, while the server-side
+            # ``current.source_text`` already carries the rendered DSL
+            # too (``from_api_dict`` doesn't try to parse the block back
+            # into structured slots). Matching on the raw ``source_text``
+            # would treat every slot-bearing intent as drifted and force
+            # a useless PATCH on every sync.
             merged = dataclasses.replace(desired, intent_id=current.intent_id)
             if (
                 merged.human_readable_name == current.human_readable_name
-                and merged.source_text == current.source_text
+                and merged.rendered_source_text == current.source_text
                 and merged.positive_tests == current.positive_tests
                 and merged.negative_tests == current.negative_tests
                 and merged.is_activation == current.is_activation
@@ -689,6 +879,84 @@ class DialogsSkillCreator:
                     await self.delete_intent(csrf, skill_id, stale.intent_id)
 
         return out
+
+    # -----------------------------------------------------------------------
+    # Custom-entities management (aliceSkill channel only)
+    # -----------------------------------------------------------------------
+
+    async def set_entities_source(
+        self,
+        csrf: str,
+        skill_id: str,
+        source_text: str,
+    ) -> None:
+        """Replace the skill's custom-entities source text in one PUT.
+
+        Single-shot replace: the endpoint stores the entire Granet
+        DSL text for all entities together (Yandex doesn't expose
+        per-entity CRUD). An empty ``source_text`` clears all custom
+        entities. The PUT is naturally idempotent server-side.
+
+        Raises :class:`DialogsEntitiesValidationError` on Granet
+        validation failures (HTTP 400 with a ``"Granet grammar
+        validation error."`` body), and other typed
+        :class:`DialogsApiError` subclasses on transport failures via
+        :func:`parse_error_body`.
+        """
+        url = f"{DIALOGS_API_BASE}/apps/{skill_id}/drafts/entities?channel={DIALOG_CHANNEL}"
+        async with self._session.request(
+            "PUT",
+            url,
+            json={"sourceText": source_text},
+            headers={
+                "x-csrf-token": csrf,
+                "content-type": "application/json",
+                "accept": "application/json",
+            },
+        ) as resp:
+            body = await resp.text()
+            if resp.status == 200:
+                return
+            # Granet validation comes back as a Spring servlet 400. We can't
+            # rely on parse_error_body alone to discriminate it from a
+            # generic 400 because both ride the same envelope; sniff for the
+            # "Granet" marker in the message.
+            if resp.status == 400 and "Granet" in body:
+                _LOGGER.debug(
+                    "set_entities_source validation failure: skill=%s body=%r request=%r",
+                    skill_id,
+                    body,
+                    source_text,
+                )
+                raise DialogsEntitiesValidationError(
+                    "Granet grammar validation error in custom entities",
+                    step="set_entities_source",
+                    http_status=400,
+                    yandex_error=body,
+                )
+            raise parse_error_body(body, http_status=resp.status, step="set_entities_source")
+
+    async def set_entities(
+        self,
+        csrf: str,
+        skill_id: str,
+        entities: list[EntityDraft],
+    ) -> None:
+        """Idempotent declarative setter for the skill's custom entities.
+
+        Renders ``entities`` to a single Granet ``sourceText`` blob via
+        :func:`_render_entities_source` and replaces the server-side
+        state with one PUT. An empty ``entities`` list clears all
+        custom entities (the endpoint accepts an empty ``sourceText``).
+
+        Idempotency is server-side: re-running with unchanged input
+        yields HTTP 200 without observable effect. Unlike
+        :meth:`set_intents`, no client-side diff is performed — the
+        custom-entities endpoint stores raw text and a single PUT is
+        cheap.
+        """
+        rendered = _render_entities_source(tuple(entities))
+        await self.set_entities_source(csrf, skill_id, rendered)
 
     # -----------------------------------------------------------------------
     # Internal helpers
@@ -1043,6 +1311,7 @@ async def auto_create_skill(
     category: str | None = None,
     voice: str | None = None,
     intents: list[IntentDraft] | None = None,
+    entities: list[EntityDraft] | None = None,
     progress_cb: Callable[[SkillCreationArtifacts], Awaitable[None]] | None = None,
     creator_factory: Callable[[aiohttp.ClientSession], DialogsSkillCreator] | None = None,
     developer_name: str = "Skill creator",
@@ -1068,6 +1337,22 @@ async def auto_create_skill(
     - ``progress_cb`` is invoked after each successful step with the updated
       artifacts; persist them and on the next call pass the saved artifacts
       back in so the pipeline resumes from the latest completed step.
+
+    Custom NLU parameters (``aliceSkill`` only — silently ignored on
+    ``smartHome``):
+
+    - ``intents`` — declarative list of custom intents to sync after the
+      draft update. ``None`` (default) leaves whatever is on the server
+      alone; ``[]`` deletes all custom intents (declarative empty
+      state). Idempotent: matched against the server state by
+      ``form_name``, only diffs are PATCHed (see
+      :meth:`DialogsSkillCreator.set_intents`).
+    - ``entities`` — declarative list of custom entities to sync.
+      ``None`` (default) leaves the server-side ``customEntities``
+      ``sourceText`` alone; ``[]`` clears all custom entities.
+      Synced **before** ``intents`` so intent grammars referencing
+      entity types pass Granet validation. Single-shot replace via
+      PUT (see :meth:`DialogsSkillCreator.set_entities`).
 
     Authentication is the caller's responsibility: ``authenticator`` is a
     no-arg async-context-manager factory that yields an
@@ -1125,6 +1410,7 @@ async def auto_create_skill(
                     category=category,
                     voice=voice,
                     intents=intents,
+                    entities=entities,
                     developer_name=developer_name,
                     progress_cb=track,
                 )
@@ -1196,6 +1482,7 @@ async def _execute_pipeline(
     category: str | None,
     voice: str | None,
     intents: list[IntentDraft] | None,
+    entities: list[EntityDraft] | None,
     developer_name: str,
     progress_cb: Callable[[SkillCreationArtifacts], Awaitable[None]] | None,
 ) -> SkillCreationArtifacts:
@@ -1256,6 +1543,15 @@ async def _execute_pipeline(
             artifacts=artifacts,
             progress_cb=progress_cb,
         )
+    # Custom entities (aliceSkill only) — must run BEFORE _step_set_intents
+    # so intent grammars referencing entity types pass Granet validation.
+    artifacts = await _step_set_entities(
+        creator=creator,
+        csrf=csrf,
+        artifacts=artifacts,
+        channel=channel,
+        entities=entities,
+    )
     # Custom intents (aliceSkill only) — sync between draft update / OAuth attach
     # and deploy. No-op when intents=None or channel=smartHome.
     artifacts = await _step_set_intents(
@@ -1463,6 +1759,44 @@ async def _step_checkpoint_deploy_requested(
     return artifacts
 
 
+async def _step_set_entities(
+    *,
+    creator: DialogsSkillCreator,
+    csrf: str,
+    artifacts: SkillCreationArtifacts,
+    channel: Channel,
+    entities: list[EntityDraft] | None,
+) -> SkillCreationArtifacts:
+    """Sync custom entities on the skill. No-op when not applicable.
+
+    Custom entities are an ``aliceSkill``-only feature, so the step
+    short-circuits on ``smartHome``. ``entities=None`` means "leave
+    whatever's there alone"; ``entities=[]`` clears all custom entities
+    (declarative empty state).
+
+    Doesn't transition the state machine — runs between draft update /
+    OAuth attach and ``_step_set_intents``. Idempotent server-side, so
+    retries are cheap.
+    """
+    if channel != DIALOG_CHANNEL or entities is None:
+        return artifacts
+    if artifacts.skill_id is None:
+        return artifacts
+    if artifacts.state not in (
+        SkillCreationState.DRAFT_UPDATED,
+        SkillCreationState.OAUTH_ATTACHED,
+    ):
+        return artifacts
+    _LOGGER.info(
+        "auto-skill: syncing %d custom entit%s on skill %s",
+        len(entities),
+        "y" if len(entities) == 1 else "ies",
+        artifacts.skill_id,
+    )
+    await creator.set_entities(csrf, artifacts.skill_id, entities)
+    return artifacts
+
+
 async def _step_set_intents(
     *,
     creator: DialogsSkillCreator,
@@ -1548,6 +1882,7 @@ async def auto_update_skill(
     category: str | None = None,
     voice: str | None = None,
     intents: list[IntentDraft] | None = None,
+    entities: list[EntityDraft] | None = None,
     progress_cb: Callable[[SkillCreationArtifacts], Awaitable[None]] | None = None,
     creator_factory: Callable[[aiohttp.ClientSession], DialogsSkillCreator] | None = None,
     developer_name: str = "Skill creator",
@@ -1581,6 +1916,12 @@ async def auto_update_skill(
             is on the server alone; ``[]`` deletes all custom intents.
             Idempotent: matched against the server state by ``form_name``,
             only diffs are PATCHed.
+        entities: Declarative list of custom entities to sync (``aliceSkill``
+            only). ``None`` leaves the server-side ``customEntities``
+            ``sourceText`` alone; ``[]`` clears all custom entities. Synced
+            **before** ``intents`` so intent grammars referencing entity
+            types pass Granet validation. Single-shot replace via PUT —
+            see :meth:`DialogsSkillCreator.set_entities`.
         progress_cb: Awaitable called after each state transition.
         creator_factory: Override for the low-level client (used in tests).
         developer_name: Developer display name embedded in the draft.
@@ -1624,6 +1965,18 @@ async def auto_update_skill(
                 )
 
             await creator.update_draft(csrf, skill_id, draft)
+            # Custom entities sync (aliceSkill only). MUST run before
+            # set_intents so intent grammars that reference entity
+            # types pass Granet validation. set_entities is a single
+            # PUT, idempotent on the server side.
+            if channel == DIALOG_CHANNEL and entities is not None:
+                _LOGGER.info(
+                    "auto-skill: syncing %d custom entit%s on skill %s",
+                    len(entities),
+                    "y" if len(entities) == 1 else "ies",
+                    skill_id,
+                )
+                await creator.set_entities(csrf, skill_id, entities)
             # Custom intents sync (aliceSkill only). set_intents is idempotent
             # against the live state, so re-runs are cheap.
             if channel == DIALOG_CHANNEL and intents is not None:

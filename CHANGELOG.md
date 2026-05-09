@@ -6,6 +6,47 @@ All notable changes to this project will be documented in this file. The format 
 
 ## [Unreleased]
 
+## [2.2.0] — 2026-05-09
+
+### Added
+
+- **`SlotDeclaration` + `IntentDraft.slots`** — typed authoring of
+  Yandex custom-intent slots. Pass a tuple of `SlotDeclaration(name,
+  type, source)` to `IntentDraft` and the library composes the
+  matching `slots:` block of DSL into `sourceText` automatically at
+  serialise time (via the new `IntentDraft.rendered_source_text`
+  property). Callers no longer have to hand-roll the block and keep
+  it in sync with a separate dataclass — the structured definition is
+  the single source of truth. Round-tripping through `from_api_dict`
+  keeps the rendered DSL in `source_text` and leaves the structured
+  `slots` tuple empty (server-side `sourceText` is authoritative for
+  diff comparisons).
+- **`set_intents` diffs against `rendered_source_text`** — the server
+  always returns the rendered DSL in `sourceText`, so comparing local
+  raw `source_text` would treat every slot-bearing intent as drifted
+  and force a useless PATCH on every sync. Idempotency is now
+  preserved when callers migrate hand-rolled grammars to structured
+  `slots`.
+- **`EntityDraft` + `EntityValue` + `set_entities` /
+  `set_entities_source`** — typed authoring of Yandex custom entities
+  for the `aliceSkill` channel. Compose a list of `EntityDraft(name,
+  values=(EntityValue(name, phrases), ...))` and call
+  `creator.set_entities(csrf, skill_id, entities)`; the library
+  renders the Granet DSL and PUTs it via the
+  `/apps/{id}/drafts/entities?channel=aliceSkill` endpoint —
+  single-shot replace, idempotent server-side. Granet validation
+  failures (HTTP 400 with `"Granet grammar validation error."`) are
+  surfaced as the new typed `DialogsEntitiesValidationError` (subclass
+  of `DialogsValidationError`). The endpoint shape was probed live
+  on 2026-05-09 — see `RESEARCH.md` §7.6.
+- **`entities` parameter in `auto_create_skill` / `auto_update_skill`**
+  — declarative custom-entities sync sits in the same pipeline as the
+  existing `intents` parameter, but runs **before** it so intent
+  grammars referencing entity types pass Granet validation.
+  `entities=None` leaves the server alone; `entities=[]` clears all
+  custom entities. Smart-home channel ignores the parameter
+  (entities are an `aliceSkill`-only feature).
+
 ## [2.1.2] — 2026-05-09
 
 ### Fixed

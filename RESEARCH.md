@@ -915,9 +915,41 @@ create»: пустой POST → PATCH с реальными данными.
 
 6. **Заголовки CSRF и cookies** — те же, что у других endpoints (используем существующий механизм `_patch_json` etc.).
 
-### 7.6. Не охвачено probe-ом (TODO)
+### 7.6. Endpoint для сущностей (probe 2026-05-09)
 
-- Endpoint(ы) для **сущностей** (`entity Player: values: ...`) — на странице Интенты есть Monaco-редактор «Сущности», но мы не успели сохранить там что-то и поймать сетевой запрос. Вероятная схема — `/apps/{id}/custom-entities/draft` или похожая.
+**`PUT /apps/{skill_id}/drafts/entities?channel=aliceSkill`** — single-shot replace.
+
+- Метод: `PUT` (не CRUD per-entity).
+- Body: `{"sourceText": "<Granet entities DSL целиком>"}`.
+- Headers: `x-csrf-token`, `content-type: application/json`,
+  `accept: application/json`.
+- Success: HTTP 200 с `{}`.
+- Granet validation failure: HTTP 400, тело шейпа Spring servlet с
+  `"message": "Granet grammar validation error."`.
+- Read-side: `GET /apps/{id}/drafts/entities?...` → 405. Текущее
+  состояние читается из `result.draft.customEntities` ответа на
+  `GET /apps/{id}` (string).
+- Внутренний URL: `/api/dev-console/v1/apps/{id}/drafts/entities`.
+- Реализовано в `IntentDraft`/`EntityDraft` API библиотеки (v2.2.0,
+  2026-05-09).
+
+**Подтверждённый DSL валидной грамматики:**
+
+```
+entity time_unit:
+    values:
+        seconds:
+            секунда | секунды | сек
+        minutes:
+            минута | минуты | мин
+```
+
+(`entity <name>:` → `values:` → `<value>:` → строка с альтернативами
+через `|` на indent +4 пробела; рендерится автоматически
+`EntityDraft.to_dsl()`.)
+
+### 7.7. Не охвачено probe-ом (остаточные TODO)
+
 - `isActivation: true` — назначение поля. Гипотеза: интент-маркер для активационных фраз, заменяющий entries в `activationPhrases`.
 - Endpoint списка всех опубликованных (не draft) интентов: `/intents` (без `/drafts`)? — UI его не дёргал.
 - Запрос `/intents/{id}/test` — кнопка «Протестировать» в UI; стоит probe-нуть отдельно для validation API.

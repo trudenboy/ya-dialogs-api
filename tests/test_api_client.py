@@ -22,13 +22,17 @@ from ya_dialogs_api import (
     DialogsAuthError,
     DialogsCsrfError,
     DialogsDuplicateSkillError,
+    DialogsEntitiesValidationError,
     DialogsIntentValidationError,
     DialogsSkillCreator,
     DialogsSkillNotFoundError,
     DialogsValidationError,
+    EntityDraft,
+    EntityValue,
     IntentDraft,
     SkillCreationArtifacts,
     SkillCreationState,
+    SlotDeclaration,
     auto_create_skill,
     auto_update_skill,
     build_dialog_draft_payload,
@@ -1177,6 +1181,131 @@ class TestAutoUpdateSkill:
         assert snapshots[0].last_known_name == "Updated"
 
 
+class TestAutoUpdateSkillEntities:
+    """auto_update_skill: ``entities`` parameter is forwarded to the
+    ``set_entities`` step on aliceSkill (and is a no-op on smartHome).
+    """
+
+    @pytest.mark.asyncio
+    async def test_dialog_entities_forwarded_to_set_entities(self) -> None:
+        """aliceSkill update with entities calls creator.set_entities once."""
+        creator = _make_creator_mock()
+        artifacts = SkillCreationArtifacts(
+            state=SkillCreationState.DONE,
+            skill_id="sk-1",
+            logo_id="lg-1",
+        )
+        entities = [
+            EntityDraft(
+                name="time_unit",
+                values=(EntityValue(name="seconds", phrases=("сек",)),),
+            )
+        ]
+        result = await auto_update_skill(
+            authenticator=_fake_authenticator(),
+            artifacts=artifacts,
+            skill_name="N",
+            backend_uri=_TEST_DIALOG_BACKEND_URI,
+            channel=DIALOG_CHANNEL,
+            description="D",
+            entities=entities,
+            creator_factory=lambda _s: creator,
+        )
+        assert result.state == SkillCreationState.DONE
+        creator.set_entities.assert_awaited_once_with("csrf-token", "sk-1", entities)
+
+    @pytest.mark.asyncio
+    async def test_dialog_entities_none_does_not_touch_set_entities(self) -> None:
+        """``entities=None`` (default) leaves server-side entities alone."""
+        creator = _make_creator_mock()
+        artifacts = SkillCreationArtifacts(
+            state=SkillCreationState.DONE,
+            skill_id="sk-1",
+            logo_id="lg-1",
+        )
+        result = await auto_update_skill(
+            authenticator=_fake_authenticator(),
+            artifacts=artifacts,
+            skill_name="N",
+            backend_uri=_TEST_DIALOG_BACKEND_URI,
+            channel=DIALOG_CHANNEL,
+            description="D",
+            creator_factory=lambda _s: creator,
+        )
+        assert result.state == SkillCreationState.DONE
+        creator.set_entities.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_dialog_entities_empty_list_clears(self) -> None:
+        """``entities=[]`` is the explicit clear-all signal — set_entities is called."""
+        creator = _make_creator_mock()
+        artifacts = SkillCreationArtifacts(
+            state=SkillCreationState.DONE,
+            skill_id="sk-1",
+            logo_id="lg-1",
+        )
+        result = await auto_update_skill(
+            authenticator=_fake_authenticator(),
+            artifacts=artifacts,
+            skill_name="N",
+            backend_uri=_TEST_DIALOG_BACKEND_URI,
+            channel=DIALOG_CHANNEL,
+            description="D",
+            entities=[],
+            creator_factory=lambda _s: creator,
+        )
+        assert result.state == SkillCreationState.DONE
+        creator.set_entities.assert_awaited_once_with("csrf-token", "sk-1", [])
+
+    @pytest.mark.asyncio
+    async def test_smart_home_ignores_entities(self) -> None:
+        """smartHome channel never invokes set_entities even if entities=[...]."""
+        creator = _make_creator_mock()
+        artifacts = SkillCreationArtifacts(
+            state=SkillCreationState.DONE,
+            skill_id="sk-1",
+            logo_id="lg-1",
+        )
+        await auto_update_skill(
+            authenticator=_fake_authenticator(),
+            artifacts=artifacts,
+            skill_name="N",
+            backend_uri=_TEST_BACKEND_URI,
+            channel=SMART_HOME_CHANNEL,
+            entities=[EntityDraft(name="x", values=())],
+            creator_factory=lambda _s: creator,
+        )
+        creator.set_entities.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_dialog_entities_called_before_intents(self) -> None:
+        """Entities must be synced before intents (intent grammars may
+        reference entity types — a fresh intent referring to an entity
+        that hasn't been declared yet would fail Granet validation).
+        """
+        creator = _make_creator_mock()
+        call_order: list[str] = []
+        creator.set_entities.side_effect = lambda *_a, **_kw: call_order.append("entities")
+        creator.set_intents.side_effect = lambda *_a, **_kw: call_order.append("intents")
+        artifacts = SkillCreationArtifacts(
+            state=SkillCreationState.DONE,
+            skill_id="sk-1",
+            logo_id="lg-1",
+        )
+        await auto_update_skill(
+            authenticator=_fake_authenticator(),
+            artifacts=artifacts,
+            skill_name="N",
+            backend_uri=_TEST_DIALOG_BACKEND_URI,
+            channel=DIALOG_CHANNEL,
+            description="D",
+            entities=[EntityDraft(name="e", values=())],
+            intents=[IntentDraft(form_name="i.1", source_text="root: x")],
+            creator_factory=lambda _s: creator,
+        )
+        assert call_order == ["entities", "intents"]
+
+
 class TestLoadDefaultLogoBytes:
     """load_default_logo_bytes reads the bundled PNG from package resources."""
 
@@ -1284,6 +1413,123 @@ class TestIntentDraft:
         assert with_id["id"] == "abc"
         without_id = IntentDraft(form_name="x").to_api_dict()
         assert "id" not in without_id
+
+
+class TestIntentDraftSlots:
+    """SlotDeclaration + IntentDraft.slots: structured slot authoring.
+
+    Slots are typed declarations that the library composes into a
+    ``slots:`` DSL block at serialise time, so callers don't have to
+    keep the dataclass and the hand-rolled DSL block in sync. The
+    server-side ``sourceText`` always carries the full rendered DSL
+    (block + grammar), and ``set_intents`` diff-matches local renders
+    against server-side ``sourceText``.
+    """
+
+    def test_slots_default_empty_tuple(self) -> None:
+        """Backward-compat: omitting `slots` yields an empty tuple."""
+        intent = IntentDraft(form_name="x")
+        assert intent.slots == ()
+
+    def test_rendered_source_text_no_slots_returns_source_verbatim(self) -> None:
+        """Without slots the rendered DSL equals the input source_text."""
+        intent = IntentDraft(form_name="x", source_text="root: пауза\n")
+        assert intent.rendered_source_text == "root: пауза\n"
+
+    def test_rendered_source_text_appends_slots_block(self) -> None:
+        """A non-empty `slots` tuple is materialised as a `slots:` DSL block."""
+        intent = IntentDraft(
+            form_name="control.volume_set",
+            source_text="root:\n    громкость $Level\n$Level: $YANDEX.NUMBER\n",
+            slots=(SlotDeclaration(name="level", type="YANDEX.NUMBER", source="$Level"),),
+        )
+        rendered = intent.rendered_source_text
+        assert "slots:" in rendered
+        assert "    level:" in rendered
+        assert "        type: YANDEX.NUMBER" in rendered
+        assert "        source: $Level" in rendered
+        # Original grammar is preserved verbatim in front of the block.
+        assert rendered.startswith("root:\n    громкость $Level\n$Level: $YANDEX.NUMBER\n")
+
+    def test_rendered_source_text_preserves_existing_slots_block(self) -> None:
+        """If the source_text already declares slots, no auto-generated block is appended.
+
+        Round-tripping IntentDraft through the API would otherwise double
+        the block: server-side sourceText already contains the rendered
+        slots, and `from_api_dict` keeps that text but leaves
+        IntentDraft.slots empty.
+        """
+        src = (
+            "root:\n    громкость $Level\n"
+            "$Level: $YANDEX.NUMBER\n"
+            "slots:\n    level:\n        type: YANDEX.NUMBER\n        source: $Level\n"
+        )
+        intent = IntentDraft(
+            form_name="x",
+            source_text=src,
+            # Even when slots tuple is set, presence of an existing block
+            # short-circuits — the author is presumed to know best.
+            slots=(SlotDeclaration(name="level", type="YANDEX.NUMBER", source="$Level"),),
+        )
+        assert intent.rendered_source_text == src
+        # Single occurrence — not duplicated.
+        assert intent.rendered_source_text.count("slots:") == 1
+
+    def test_rendered_source_text_handles_multiple_slots(self) -> None:
+        """All declared slots end up in the rendered block in declaration order."""
+        intent = IntentDraft(
+            form_name="control.seek_forward",
+            source_text=(
+                "root:\n    вперёд $Amount $Unit\n$Amount: $YANDEX.NUMBER\n$Unit: $time_unit\n"
+            ),
+            slots=(
+                SlotDeclaration(name="amount", type="YANDEX.NUMBER", source="$Amount"),
+                SlotDeclaration(name="unit", type="time_unit", source="$Unit"),
+            ),
+        )
+        rendered = intent.rendered_source_text
+        amount_pos = rendered.find("    amount:")
+        unit_pos = rendered.find("    unit:")
+        assert 0 < amount_pos < unit_pos
+        assert "        type: time_unit" in rendered
+        assert "        source: $Unit" in rendered
+
+    def test_to_api_dict_uses_rendered_source_text(self) -> None:
+        """The wire payload carries the rendered DSL, not the raw input."""
+        intent = IntentDraft(
+            form_name="control.volume_set",
+            source_text="root:\n    громкость $Level\n$Level: $YANDEX.NUMBER\n",
+            slots=(SlotDeclaration(name="level", type="YANDEX.NUMBER", source="$Level"),),
+        )
+        payload = intent.to_api_dict()
+        assert "slots:" in payload["sourceText"]
+        assert "    level:" in payload["sourceText"]
+
+    def test_to_api_dict_no_slots_keeps_source_text_unchanged(self) -> None:
+        """No-slots intent serialises with source_text verbatim — no surprise mutation."""
+        intent = IntentDraft(form_name="x", source_text="root: пауза\n")
+        assert intent.to_api_dict()["sourceText"] == "root: пауза\n"
+
+    def test_from_api_dict_leaves_slots_tuple_empty(self) -> None:
+        """`from_api_dict` keeps the rendered DSL in source_text and leaves
+        the structured `slots` tuple empty.
+
+        We don't parse the DSL block back into structured form — server
+        is the source of truth for rendered text, and `set_intents` diff
+        compares rendered local against server-side sourceText.
+        """
+        intent = IntentDraft.from_api_dict(
+            {
+                "id": "u1",
+                "formName": "control.volume_set",
+                "sourceText": (
+                    "root:\n    громкость $Level\n$Level: $YANDEX.NUMBER\n"
+                    "slots:\n    level:\n        type: YANDEX.NUMBER\n        source: $Level\n"
+                ),
+            }
+        )
+        assert intent.slots == ()
+        assert "slots:" in intent.source_text
 
 
 class TestIntentCRUD:
@@ -1702,6 +1948,304 @@ class TestIntentCRUD:
         assert session.delete.call_count == 1
         url = session.delete.call_args.args[0]
         assert "/intents/stale-uuid/draft" in url
+
+    @pytest.mark.asyncio
+    async def test_set_intents_skips_patch_when_local_slots_match_server_rendered(
+        self,
+    ) -> None:
+        """A local IntentDraft with structured slots compares equal to a
+        server-side intent whose `sourceText` already contains the
+        rendered `slots:` block.
+
+        Without rendered-vs-rendered diffing `set_intents` would PATCH
+        on every sync because the local `source_text` (sans block)
+        wouldn't match the server's (with block). This test pins the
+        idempotency guarantee.
+        """
+        session = _make_session()
+        session.get = MagicMock()
+        session.request = MagicMock()
+        rendered = (
+            "root:\n    громкость $Level\n$Level: $YANDEX.NUMBER\n"
+            "slots:\n    level:\n        type: YANDEX.NUMBER\n        source: $Level\n"
+        )
+        list_resp = _mock_response(
+            status=200,
+            body_json={
+                "result": [
+                    {
+                        "id": "vol-uuid",
+                        "humanReadableName": "Volume",
+                        "isActivation": False,
+                        "status": "NEW",
+                    }
+                ]
+            },
+        )
+        full_resp = _mock_response(
+            status=200,
+            body_json={
+                "result": {
+                    "id": "vol-uuid",
+                    "formName": "control.volume_set",
+                    "humanReadableName": "Volume",
+                    "sourceText": rendered,
+                    "positiveTests": "",
+                    "negativeTests": "",
+                    "isActivation": False,
+                    "status": "NEW",
+                }
+            },
+        )
+
+        def _ctx(resp: AsyncMock) -> MagicMock:
+            ctx = MagicMock()
+            ctx.__aenter__ = AsyncMock(return_value=resp)
+            ctx.__aexit__ = AsyncMock(return_value=False)
+            return ctx
+
+        session.get.side_effect = [_ctx(list_resp), _ctx(full_resp)]
+        creator = DialogsSkillCreator(session, channel=DIALOG_CHANNEL)
+        desired = [
+            IntentDraft(
+                form_name="control.volume_set",
+                human_readable_name="Volume",
+                source_text="root:\n    громкость $Level\n$Level: $YANDEX.NUMBER\n",
+                slots=(SlotDeclaration(name="level", type="YANDEX.NUMBER", source="$Level"),),
+            )
+        ]
+        await creator.set_intents("csrf", "skill-1", desired, delete_missing=False)
+        # No mutating call: identical after rendering.
+        assert session.request.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_set_intents_patches_with_rendered_source_when_slots_change(
+        self,
+    ) -> None:
+        """When slots differ, the outgoing PATCH carries the rendered DSL with the slots block."""
+        session = _make_session()
+        session.get = MagicMock()
+        session.request = MagicMock()
+        list_resp = _mock_response(
+            status=200,
+            body_json={
+                "result": [
+                    {
+                        "id": "vol-uuid",
+                        "humanReadableName": "Volume",
+                        "isActivation": False,
+                        "status": "NEW",
+                    }
+                ]
+            },
+        )
+        full_resp = _mock_response(
+            status=200,
+            body_json={
+                "result": {
+                    "id": "vol-uuid",
+                    "formName": "control.volume_set",
+                    "humanReadableName": "Volume",
+                    # Server has no slots block yet — local upgrades to slot version.
+                    "sourceText": "root: громкость 50",
+                    "positiveTests": "",
+                    "negativeTests": "",
+                    "isActivation": False,
+                    "status": "NEW",
+                }
+            },
+        )
+
+        def _ctx(resp: AsyncMock) -> MagicMock:
+            ctx = MagicMock()
+            ctx.__aenter__ = AsyncMock(return_value=resp)
+            ctx.__aexit__ = AsyncMock(return_value=False)
+            return ctx
+
+        session.get.side_effect = [_ctx(list_resp), _ctx(full_resp)]
+        patch_resp = _mock_response(
+            status=200,
+            body_json={
+                "result": {
+                    "intent": {
+                        "id": "vol-uuid",
+                        "formName": "control.volume_set",
+                        "humanReadableName": "Volume",
+                        "sourceText": "root: ...",
+                        "positiveTests": "",
+                        "negativeTests": "",
+                        "isActivation": False,
+                        "status": "NEW",
+                    }
+                }
+            },
+        )
+        request_ctx = MagicMock()
+        request_ctx.__aenter__ = AsyncMock(return_value=patch_resp)
+        request_ctx.__aexit__ = AsyncMock(return_value=False)
+        session.request.return_value = request_ctx
+
+        creator = DialogsSkillCreator(session, channel=DIALOG_CHANNEL)
+        desired = [
+            IntentDraft(
+                form_name="control.volume_set",
+                human_readable_name="Volume",
+                source_text="root:\n    громкость $Level\n$Level: $YANDEX.NUMBER\n",
+                slots=(SlotDeclaration(name="level", type="YANDEX.NUMBER", source="$Level"),),
+            )
+        ]
+        await creator.set_intents("csrf", "skill-1", desired, delete_missing=False)
+        # PATCH carried rendered DSL (with slot block) — the server gets the upgrade.
+        assert session.request.call_count == 1
+        body = session.request.call_args.kwargs["json"]
+        assert "slots:" in body["sourceText"]
+        assert "    level:" in body["sourceText"]
+        assert "        type: YANDEX.NUMBER" in body["sourceText"]
+
+
+# ---------------------------------------------------------------------------
+# Custom entities (aliceSkill — single-shot replace via PUT)
+# ---------------------------------------------------------------------------
+
+
+class TestEntityDraft:
+    """EntityDraft / EntityValue — Granet entities DSL serialisation."""
+
+    def test_entity_value_renders_alternation(self) -> None:
+        """A value with multiple phrases renders as ``phrase | phrase | ...``."""
+        value = EntityValue(name="seconds", phrases=("секунда", "секунды", "сек"))
+        assert value.to_dsl() == "        seconds:\n            секунда | секунды | сек"
+
+    def test_entity_value_with_single_phrase_renders_without_pipe(self) -> None:
+        """A single-phrase value renders the bare phrase, no separator."""
+        value = EntityValue(name="solo", phrases=("одна",))
+        assert value.to_dsl() == "        solo:\n            одна"
+
+    def test_entity_draft_renders_full_block(self) -> None:
+        """An EntityDraft renders ``entity <name>:`` then a ``values:`` block."""
+        entity = EntityDraft(
+            name="time_unit",
+            values=(
+                EntityValue(name="seconds", phrases=("секунда", "секунды", "сек")),
+                EntityValue(name="minutes", phrases=("минута", "минуты", "мин")),
+            ),
+        )
+        rendered = entity.to_dsl()
+        assert rendered.startswith("entity time_unit:")
+        assert "    values:" in rendered
+        assert "        seconds:" in rendered
+        assert "            секунда | секунды | сек" in rendered
+        assert "        minutes:" in rendered
+        assert "            минута | минуты | мин" in rendered
+
+    def test_entity_draft_empty_values_renders_header_only(self) -> None:
+        """Empty values are legal at the dataclass level (server may reject)."""
+        entity = EntityDraft(name="empty", values=())
+        # Header + values: block. Server validation is the source of truth
+        # for whether this is acceptable; the renderer doesn't enforce.
+        assert "entity empty:" in entity.to_dsl()
+
+
+class TestSetEntities:
+    """``set_entities`` / ``set_entities_source`` — PUT against the
+    ``/apps/{id}/drafts/entities`` endpoint with Granet validation
+    surfaced as :class:`DialogsEntitiesValidationError`.
+    """
+
+    @pytest.mark.asyncio
+    async def test_set_entities_source_puts_text_to_entities_endpoint(self) -> None:
+        """Raw source_text path: PUT carries ``{"sourceText": <text>}`` body."""
+        session = _make_session()
+        _install_ctx(
+            session.request,
+            _mock_response(status=200, body_json={}),
+        )
+        creator = DialogsSkillCreator(session, channel=DIALOG_CHANNEL)
+        await creator.set_entities_source(
+            "csrf", "skill-1", "entity x:\n    values:\n        a:\n            раз\n"
+        )
+        method, url = session.request.call_args.args[:2]
+        assert method == "PUT"
+        assert "/apps/skill-1/drafts/entities" in url
+        assert "channel=aliceSkill" in url
+        body = session.request.call_args.kwargs["json"]
+        assert body == {
+            "sourceText": "entity x:\n    values:\n        a:\n            раз\n",
+        }
+
+    @pytest.mark.asyncio
+    async def test_set_entities_renders_drafts_to_source_text(self) -> None:
+        """Structured-input path: list[EntityDraft] → rendered DSL → PUT."""
+        session = _make_session()
+        _install_ctx(session.request, _mock_response(status=200, body_json={}))
+        creator = DialogsSkillCreator(session, channel=DIALOG_CHANNEL)
+        await creator.set_entities(
+            "csrf",
+            "skill-1",
+            [
+                EntityDraft(
+                    name="time_unit",
+                    values=(EntityValue(name="seconds", phrases=("секунда", "сек")),),
+                )
+            ],
+        )
+        body = session.request.call_args.kwargs["json"]
+        assert "entity time_unit:" in body["sourceText"]
+        assert "        seconds:" in body["sourceText"]
+        assert "секунда | сек" in body["sourceText"]
+
+    @pytest.mark.asyncio
+    async def test_set_entities_empty_list_clears_source(self) -> None:
+        """An empty entities list PUTs an empty sourceText (clear all)."""
+        session = _make_session()
+        _install_ctx(session.request, _mock_response(status=200, body_json={}))
+        creator = DialogsSkillCreator(session, channel=DIALOG_CHANNEL)
+        await creator.set_entities("csrf", "skill-1", [])
+        body = session.request.call_args.kwargs["json"]
+        assert body == {"sourceText": ""}
+
+    @pytest.mark.asyncio
+    async def test_set_entities_invalid_grammar_raises_typed_error(self) -> None:
+        """HTTP 400 with ``Granet grammar validation error`` → typed exception."""
+        session = _make_session()
+        _install_ctx(
+            session.request,
+            _mock_response(
+                status=400,
+                body_json={
+                    "servlet": "dispatcherServlet",
+                    "message": "Granet grammar validation error.",
+                    "url": "/api/dev-console/v1/apps/skill-1/drafts/entities",
+                    "status": "400",
+                },
+            ),
+        )
+        creator = DialogsSkillCreator(session, channel=DIALOG_CHANNEL)
+        with pytest.raises(DialogsEntitiesValidationError) as exc_info:
+            await creator.set_entities_source("csrf", "skill-1", "broken")
+        assert exc_info.value.http_status == 400
+        assert "Granet" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_set_entities_other_4xx_raises_generic_api_error(self) -> None:
+        """A non-Granet 4xx is parsed by the standard error-body machinery."""
+        session = _make_session()
+        skill_id = "abc12345-dead-beef-cafe-000000000001"
+        _install_ctx(
+            session.request,
+            _mock_response(
+                status=404,
+                body_json={
+                    "servlet": "dispatcherServlet",
+                    "message": f"Skill not found with id: {skill_id}",
+                    "url": f"/api/dev-console/v1/apps/{skill_id}/drafts/entities",
+                    "status": "404",
+                },
+            ),
+        )
+        creator = DialogsSkillCreator(session, channel=DIALOG_CHANNEL)
+        with pytest.raises(DialogsSkillNotFoundError):
+            await creator.set_entities_source("csrf", skill_id, "")
 
 
 # ---------------------------------------------------------------------------
