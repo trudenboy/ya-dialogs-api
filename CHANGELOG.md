@@ -6,7 +6,39 @@ All notable changes to this project will be documented in this file. The format 
 
 ## [Unreleased]
 
-## [2.3.0] — 2026-05-09
+## [2.4.0] — 2026-05-09
+
+### Added
+
+- **`ManifestRuntime` / `ManifestMapping` / `ManifestMultiplyWhen`** —
+  optional ``[intents.runtime]`` block in the TOML manifest carrying
+  consumer-application dispatch metadata. Each intent can declare
+  `kind` / `action` (opaque tags interpreted by the consumer, e.g.
+  `"control"` / `"volume_set"`) and a list of slot-to-field mappings
+  with declarative transforms (`identity` / `clamp` / `abs_clamp`),
+  conditional unit multipliers (`multiply_when`), defaults for
+  missing slots, sign override, `reject_if_below` and `cap`
+  guard rails. The new `ManifestIntent.runtime` field is optional —
+  intents with no runtime block keep the same parsing semantics
+  as before.
+
+- **`ya_dialogs_api.runtime` — `apply_runtime_mapping`.** Generic
+  dispatcher that walks an intent's mapping rules against an
+  ``IntentMatch`` and returns a `dict[str, Any]` keyed by each
+  `ManifestMapping.field` — suitable for `**kwargs` into the
+  consumer's target dataclass. Returns `None` on skip-the-intent
+  signals (missing slot without default, value below
+  `reject_if_below`, value above `cap`). The dispatcher is opaque
+  about target types — it doesn't know whether the consumer's target
+  is a `ParsedControl`, a Pydantic model, or a function call. New
+  typed `RuntimeMappingError` for misconfigured rules.
+
+- **Strict TOML schema validation** for the new runtime block:
+  unknown `transform` / `slot_type` / `sign` values raise
+  `SkillManifestError` at parse time with the offending field path.
+  New helper `_require_int_or_none` rejects boolean coercion (since
+  Python's `isinstance(True, int)` is true) for numeric guard
+  fields like `min` / `max` / `cap` / `default` / `reject_if_below`.
 
 ### Added
 
