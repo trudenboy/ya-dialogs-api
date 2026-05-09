@@ -193,11 +193,19 @@ def parse_manifest(raw: Mapping[str, Any]) -> SkillManifest:
         intents.append(
             ManifestIntent(
                 form_name=form_name,
-                human_readable_name=str(item.get("human_readable_name") or ""),
-                is_activation=bool(item.get("is_activation", False)),
-                positive_tests=_strip_block(item.get("positive_tests", "")),
-                negative_tests=_strip_block(item.get("negative_tests", "")),
-                grammar=str(item.get("grammar") or ""),
+                human_readable_name=_require_str(
+                    item, "human_readable_name", index, default=""
+                ),
+                is_activation=_require_bool(
+                    item, "is_activation", index, default=False
+                ),
+                positive_tests=_strip_block(
+                    _require_str(item, "positive_tests", index, default="")
+                ),
+                negative_tests=_strip_block(
+                    _require_str(item, "negative_tests", index, default="")
+                ),
+                grammar=_require_str(item, "grammar", index, default=""),
             )
         )
     return SkillManifest(
@@ -224,7 +232,58 @@ def intent_to_draft(intent: ManifestIntent) -> IntentDraft:
     )
 
 
-def _strip_block(value: object) -> str:
+def _require_str(
+    item: Mapping[str, Any],
+    key: str,
+    index: int,
+    *,
+    default: str,
+) -> str:
+    """Read an optional string field from an intent entry, strict on type.
+
+    Returns ``default`` when the key is absent. When the key is
+    present, requires a string value — raises
+    :class:`SkillManifestError` otherwise (silent string-coercion
+    would let ``grammar = 123`` produce ``"123"`` and miss the actual
+    authoring bug).
+    """
+    if key not in item:
+        return default
+    value = item[key]
+    if not isinstance(value, str):
+        raise SkillManifestError(
+            f"manifest: intents[{index}].{key} must be a string, "
+            f"got {type(value).__name__}",
+        )
+    return value
+
+
+def _require_bool(
+    item: Mapping[str, Any],
+    key: str,
+    index: int,
+    *,
+    default: bool,
+) -> bool:
+    """Read an optional bool field from an intent entry, strict on type.
+
+    TOML distinguishes booleans from strings, so a stray ``is_activation
+    = "false"`` would otherwise be coerced via ``bool("false")`` →
+    ``True`` (any non-empty string is truthy). Surface the type
+    mismatch as a manifest error instead of silently flipping the flag.
+    """
+    if key not in item:
+        return default
+    value = item[key]
+    if not isinstance(value, bool):
+        raise SkillManifestError(
+            f"manifest: intents[{index}].{key} must be a boolean, "
+            f"got {type(value).__name__}",
+        )
+    return value
+
+
+def _strip_block(value: str) -> str:
     r"""Normalise a triple-quoted TOML string to ``\n``-separated lines.
 
     Triple-quoted blocks in the manifest typically open with a newline
@@ -233,8 +292,6 @@ def _strip_block(value: object) -> str:
     trailing whitespace so callers see a normalised value matching what
     Yandex stores in ``positiveTests`` / ``negativeTests``.
     """
-    if not isinstance(value, str):
-        return ""
     return value.strip()
 
 

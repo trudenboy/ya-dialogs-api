@@ -12,6 +12,8 @@ from ya_dialogs_api import (
     EntityDraft,
     EntityValue,
     IntentDraft,
+    ManifestEntities,
+    ManifestIntent,
     SkillManifest,
     SkillManifestError,
     entities_to_drafts,
@@ -19,7 +21,6 @@ from ya_dialogs_api import (
     parse_manifest,
     parse_manifest_text,
 )
-from ya_dialogs_api.manifest import ManifestIntent
 
 
 def _toml_to_dict(text: str) -> dict:  # type: ignore[type-arg]
@@ -113,6 +114,63 @@ class TestParseManifest:
         )
         with pytest.raises(SkillManifestError, match="duplicate form_name"):
             parse_manifest(raw)
+
+    def test_string_field_with_wrong_type_raises(self) -> None:
+        """``grammar = 123`` is a typo / authoring bug — surface, don't coerce."""
+        raw = {
+            "schema_version": 1,
+            "entities": {"text": ""},
+            "intents": [{"form_name": "control.x", "grammar": 123}],
+        }
+        with pytest.raises(SkillManifestError, match="grammar must be a string"):
+            parse_manifest(raw)
+
+    def test_is_activation_with_string_value_raises(self) -> None:
+        """``is_activation = "false"`` would silently coerce to True via bool() —
+        catch the type mismatch instead.
+        """
+        raw = {
+            "schema_version": 1,
+            "entities": {"text": ""},
+            "intents": [
+                {
+                    "form_name": "control.x",
+                    "is_activation": "false",
+                    "grammar": "root: x",
+                }
+            ],
+        }
+        with pytest.raises(SkillManifestError, match="is_activation must be a boolean"):
+            parse_manifest(raw)
+
+    def test_human_readable_name_with_int_value_raises(self) -> None:
+        raw = {
+            "schema_version": 1,
+            "entities": {"text": ""},
+            "intents": [
+                {
+                    "form_name": "control.x",
+                    "human_readable_name": 42,
+                    "grammar": "root: x",
+                }
+            ],
+        }
+        with pytest.raises(SkillManifestError, match="human_readable_name must be a string"):
+            parse_manifest(raw)
+
+    def test_optional_fields_default_when_absent(self) -> None:
+        """Missing optional fields default to empty / False without error."""
+        raw = {
+            "schema_version": 1,
+            "entities": {"text": ""},
+            "intents": [{"form_name": "control.x", "grammar": "root: x"}],
+        }
+        manifest = parse_manifest(raw)
+        intent = manifest.intents[0]
+        assert intent.human_readable_name == ""
+        assert intent.is_activation is False
+        assert intent.positive_tests == ""
+        assert intent.negative_tests == ""
 
     def test_intent_order_is_preserved(self) -> None:
         raw = _toml_to_dict(
@@ -280,7 +338,7 @@ class TestIntentToDraft:
     def test_manifest_to_intent_drafts_method(self) -> None:
         manifest = SkillManifest(
             schema_version=1,
-            entities=__import__("ya_dialogs_api").ManifestEntities(text=""),
+            entities=ManifestEntities(text=""),
             intents=(
                 ManifestIntent(form_name="control.a", grammar="root: a"),
                 ManifestIntent(form_name="control.b", grammar="root: b"),
