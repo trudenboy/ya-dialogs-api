@@ -48,6 +48,7 @@ __all__ = [
     "DialogsAuthError",
     "DialogsCsrfError",
     "DialogsDuplicateSkillError",
+    "DialogsEntitiesValidationError",
     "DialogsIntentValidationError",
     "DialogsSkillNotFoundError",
     "DialogsValidationError",
@@ -145,6 +146,18 @@ class DialogsSkillNotFoundError(DialogsApiError):
 
 class DialogsDuplicateSkillError(DialogsApiError):
     """Raised when create_app rejects because a skill with the same name exists."""
+
+
+class DialogsEntitiesValidationError(DialogsValidationError):
+    """Raised when Yandex rejects the custom-entities ``sourceText`` grammar.
+
+    The custom-entities endpoint validates the entire DSL block as one
+    unit (single ``PUT /apps/{id}/drafts/entities``); on error the body
+    is the standard Spring servlet shape carrying ``"Granet grammar
+    validation error."``. Unlike :class:`DialogsIntentValidationError`,
+    Yandex does not return per-character / per-line position
+    information for entities failures — only a single message.
+    """
 
 
 class DialogsIntentValidationError(DialogsValidationError):
