@@ -411,6 +411,77 @@ class TestRuntimeParsing:
         with pytest.raises(SkillManifestError, match=r"runtime\.kind"):
             parse_manifest(raw)
 
+    def test_mapping_table_instead_of_array_raises(self) -> None:
+        """``[intents.runtime.mapping]`` (table) instead of ``[[…]]`` (array) raises."""
+        raw = {
+            "schema_version": 1,
+            "entities": {"text": ""},
+            "intents": [
+                {
+                    "form_name": "control.x",
+                    "grammar": "root: x",
+                    "runtime": {
+                        "kind": "control",
+                        "action": "x",
+                        # Wrong shape: a table where an array of tables is expected.
+                        "mapping": {},
+                    },
+                }
+            ],
+        }
+        with pytest.raises(SkillManifestError, match="mapping must be an array of tables"):
+            parse_manifest(raw)
+
+    def test_multiply_when_table_instead_of_array_raises(self) -> None:
+        raw = {
+            "schema_version": 1,
+            "entities": {"text": ""},
+            "intents": [
+                {
+                    "form_name": "control.x",
+                    "grammar": "root: x",
+                    "runtime": {
+                        "kind": "control",
+                        "action": "x",
+                        "mapping": [
+                            {
+                                "field": "value",
+                                "from_slot": "n",
+                                # Wrong shape: a table.
+                                "multiply_when": {},
+                            }
+                        ],
+                    },
+                }
+            ],
+        }
+        with pytest.raises(SkillManifestError, match="multiply_when must be an array of tables"):
+            parse_manifest(raw)
+
+    def test_duplicate_field_in_mapping_raises(self) -> None:
+        """Two rules targeting the same field — silent overwrite is a bug."""
+        raw = _toml_to_dict(
+            """
+            schema_version = 1
+            [entities]
+            text = ""
+            [[intents]]
+            form_name = "control.x"
+            grammar = "root: x"
+            [intents.runtime]
+            kind = "control"
+            action = "x"
+            [[intents.runtime.mapping]]
+            field = "value"
+            from_slot = "a"
+            [[intents.runtime.mapping]]
+            field = "value"
+            from_slot = "b"
+            """
+        )
+        with pytest.raises(SkillManifestError, match="duplicate field 'value'"):
+            parse_manifest(raw)
+
     def test_runtime_action_required(self) -> None:
         raw = _toml_to_dict(
             """

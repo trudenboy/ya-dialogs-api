@@ -52,10 +52,12 @@ __all__ = [
 class RuntimeMappingError(ValueError):
     """Raised when a :class:`ManifestMapping` cannot be applied.
 
-    Currently only raised on configuration errors that the manifest
-    parser couldn't catch (e.g. ``transform="clamp"`` without ``min``
-    / ``max``). Slot-level surprises (missing slot, out of range) are
-    signalled via ``None`` return, not exceptions.
+    Reserved for misconfigurations that the manifest parser couldn't
+    catch — currently only an unknown ``slot_type`` reaching the
+    dispatcher (the parser already pins ``slot_type`` to a closed
+    set, so this is purely defensive). Slot-level surprises (missing
+    slot without default, value below ``reject_if_below``, value
+    above ``cap``) are signalled via ``None`` return, not exceptions.
     """
 
 
@@ -120,11 +122,15 @@ def _apply_numeric(match: IntentMatch, rule: ManifestMapping, value: int) -> Any
         if match.slot_str(cond.slot) == cond.equals:
             value *= cond.factor
 
-    # 2. reject_if_below — pre-transform absolute check.
+    # 2. reject_if_below — pre-transform lower-bound guard. Compares
+    # the raw (signed) value, not abs(value); a negative slot value
+    # below the threshold also rejects.
     if rule.reject_if_below is not None and value < rule.reject_if_below:
         return _SKIP
 
-    # 3. cap — pre-transform upper bound (rejects misclassifications).
+    # 3. cap — pre-transform upper-bound guard. Compares the raw
+    # (signed) value; rejects obvious misclassifications like
+    # "seek 30000 seconds" before clamp normalises them.
     if rule.cap is not None and value > rule.cap:
         return _SKIP
 

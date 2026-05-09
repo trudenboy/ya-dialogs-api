@@ -430,18 +430,32 @@ def _parse_runtime(raw: Any, intent_index: int) -> ManifestRuntime | None:
     action = raw.get("action")
     if not isinstance(action, str) or not action:
         raise SkillManifestError(f"manifest: {where}.action (non-empty str) is required")
-    mapping_raw = raw.get("mapping") or []
+    # Distinguish "missing" from "present but wrong type" — ``or []`` would
+    # silently accept a falsy mapping like ``{}`` from a stray
+    # ``[intents.runtime.mapping]`` table header.
+    mapping_raw = raw.get("mapping")
+    if mapping_raw is None:
+        mapping_raw = []
     if not isinstance(mapping_raw, list):
         raise SkillManifestError(
             f"manifest: {where}.mapping must be an array of tables",
         )
     mappings: list[ManifestMapping] = []
+    seen_fields: set[str] = set()
     for m_index, m_item in enumerate(mapping_raw):
         if not isinstance(m_item, Mapping):
             raise SkillManifestError(
                 f"manifest: {where}.mapping[{m_index}] must be a TOML table",
             )
-        mappings.append(_parse_mapping(m_item, intent_index, m_index))
+        rule = _parse_mapping(m_item, intent_index, m_index)
+        if rule.field in seen_fields:
+            raise SkillManifestError(
+                f"manifest: {where}.mapping[{m_index}] declares duplicate "
+                f"field {rule.field!r} — each target field must have at most "
+                "one rule",
+            )
+        seen_fields.add(rule.field)
+        mappings.append(rule)
     return ManifestRuntime(kind=kind, action=action, mapping=tuple(mappings))
 
 
@@ -475,7 +489,10 @@ def _parse_mapping(
         raise SkillManifestError(
             f"manifest: {where}.sign must be one of {sorted(_VALID_SIGNS)}, got {sign!r}",
         )
-    multiply_when_raw = item.get("multiply_when") or []
+    # Same "missing vs wrong type" discipline as ``mapping`` above.
+    multiply_when_raw = item.get("multiply_when")
+    if multiply_when_raw is None:
+        multiply_when_raw = []
     if not isinstance(multiply_when_raw, list):
         raise SkillManifestError(
             f"manifest: {where}.multiply_when must be an array of tables",
